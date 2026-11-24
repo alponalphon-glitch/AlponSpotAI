@@ -2,18 +2,14 @@ name: NEXORA Android CI
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   pull_request:
-    branches: [ main, master ]
+    branches: [main, master]
   workflow_dispatch:
-
-permissions:
-  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,32 +20,24 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK and accept licenses
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          accept-android-sdk-licenses: true
-          packages: |
-            platforms;android-36
-            build-tools;36.0.0
-            platform-tools
+          packages: ''
 
-      - name: Set up Gradle 8.11.1
+      - name: Install Android SDK packages
+        run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
 
-      - name: Verify build environment
-        run: |
-          java -version
-          gradle --version
-          sdkmanager --list_installed
-
-      - name: Build debug APK
+      - name: Build Debug APK
         run: gradle --no-daemon --stacktrace --max-workers=2 :app:assembleDebug
 
-      - name: Upload debug APK
+      - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: AlponSpotAI-debug
+          name: AlponSpotAI-debug-apk
           path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
