@@ -51,7 +51,7 @@ jobs:
           sdkmanager --list_installed
 
       - name: Build Debug APK
-        run: gradle --no-daemon --refresh-dependencies --stacktrace --max-workers=2 :app:assembleDebug
+        run: gradle --no-daemon --refresh-dependencies --stacktrace --max-workers=1 :app:assembleDebug
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
