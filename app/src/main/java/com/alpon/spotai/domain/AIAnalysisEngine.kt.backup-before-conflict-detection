@@ -1,0 +1,246 @@
+package com.alpon.spotai.domain
+
+import kotlin.math.abs
+
+data class AIComponentScore(
+    val name: String,
+    val score: Double,
+    val weight: Double,
+    val contribution: Double,
+    val direction: String,
+    val details: String
+)
+
+data class AIAnalysisReport(
+    val action: String,
+    val confidence: Int,
+    val directionalScore: Double,
+    val agreement: Int,
+    val components: List<AIComponentScore>,
+    val reasons: List<String>,
+    val warnings: List<String>
+)
+
+object AIAnalysisEngine {
+
+    private const val BUY_THRESHOLD = 25.0
+    private const val SELL_THRESHOLD = -25.0
+
+    fun analyze(
+        technical: Signal?,
+        multiTimeframe: MultiTimeframeSignal?,
+        structure: MarketStructureReport?
+    ): AIAnalysisReport? {
+
+        val components = mutableListOf<AIComponentScore>()
+        val reasons = mutableListOf<String>()
+        val warnings = mutableListOf<String>()
+
+        // 1. Technical Analysis: exclude Order Flow to avoid double counting.
+        if (technical != null) {
+            val families = technical.indicators
+                .filter { it.group != "Order Flow" }
+                .groupBy { it.group }
+                .values
+                .mapNotNull { family ->
+                    family.map { it.bias.toDouble() }
+                        .average()
+                        .takeIf { it.isFinite() }
+                }
+
+            if (families.isNotEmpty()) {
+                val score = families.average() * 100.0
+
+                components += component(
+                    name = "Technical Analysis",
+                    score = score,
+                    weight = 0.40,
+                    details = "${families.size} independent indicator families; " +
+                        "technical action: ${technical.action}"
+                )
+            } else {
+                warnings += "Technical indicator families are unavailable."
+            }
+
+            // 2. Order Flow: independent component.
+            val orderFlow = technical.indicators
+                .firstOrNull { it.group == "Order Flow" }
+
+            if (orderFlow != null) {
+                components += component(
+                    name = "Order Flow",
+                    score = orderFlow.bias.coerceIn(-1, 1) * 100.0,
+                    weight = 0.10,
+                    details = orderFlow.value
+                )
+            } else {
+                warnings += "Order Flow data is unavailable."
+            }
+        } else {
+            warnings += "Technical Analysis is unavailable."
+        }
+
+        // 3. Multi-Timeframe Analysis.
+        if (multiTimeframe != null) {
+            val frameScores = multiTimeframe.readings.mapNotNull { frame ->
+                val direction = when (frame.direction.uppercase()) {
+                    "BULLISH" -> 1.0
+                    "BEARISH" -> -1.0
+                    else -> 0.0
+                }
+
+                val strength = (kotlin.math.abs(frame.score - 50) * 2)
+                    .coerceIn(0, 100) / 100.0
+
+                direction * strength
+            }
+
+            if (frameScores.isNotEmpty()) {
+                val score = frameScores.average() * 100.0
+
+                components += component(
+                    name = "Multi-Timeframe",
+                    score = score,
+                    weight = 0.30,
+                    details = "${multiTimeframe.readings.size} timeframe readings; " +
+                        "alignment: ${multiTimeframe.alignment}"
+                )
+            } else {
+                warnings += "Multi-Timeframe readings are empty."
+            }
+        } else {
+            warnings += "Multi-Timeframe Analysis is unavailable."
+        }
+
+        // 4. Market Structure, BOS/CHOCH and liquidity sweeps.
+        if (structure != null) {
+            val trendScore = when (structure.trend.uppercase()) {
+                "BULLISH" -> 60.0
+                "BEARISH" -> -60.0
+                else -> 0.0
+            }
+
+            val latestEvent = structure.events.maxByOrNull { it.time }
+
+            val eventScore = when (latestEvent?.direction?.uppercase()) {
+                "BULLISH" -> 25.0
+                "BEARISH" -> -25.0
+                else -> 0.0
+            }
+
+            val liquidityScore = when (structure.liquiditySweep) {
+                "BUY_SIDE_LIQUIDITY_SWEEP" -> -30.0
+                "SELL_SIDE_LIQUIDITY_SWEEP" -> 30.0
+                else -> 0.0
+            }
+
+            val score = (
+                trendScore + eventScore + liquidityScore
+            ).coerceIn(-100.0, 100.0)
+
+            components += component(
+                name = "Market Structure",
+                score = score,
+                weight = 0.20,
+                details = "Trend: ${structure.trend}; " +
+                    "event: ${latestEvent?.name ?: "NONE"}; " +
+                    "liquidity: ${structure.liquiditySweep}"
+            )
+        } else {
+            warnings += "Market Structure data is unavailable."
+        }
+
+        if (components.isEmpty()) return null
+
+        // Normalize weights when some components are unavailable.
+        val totalWeight = components.sumOf { it.weight }
+        if (totalWeight <= 0.0) return null
+
+        val directionalScore = (
+            components.sumOf { it.score * it.weight } / totalWeight
+        ).coerceIn(-100.0, 100.0)
+
+        val activeDirections = components
+            .filter { abs(it.score) >= 15.0 }
+
+        val dominantDirection = when {
+            directionalScore > 0.0 -> 1
+            directionalScore < 0.0 -> -1
+            else -> 0
+        }
+
+        val agreement = if (dominantDirection == 0) {
+            0
+        } else {
+            activeDirections.count {
+                if (dominantDirection > 0) it.score > 0 else it.score < 0
+            }
+        }
+
+        val action = when {
+            directionalScore >= BUY_THRESHOLD -> "BUY"
+            directionalScore <= SELL_THRESHOLD -> "SELL"
+            else -> "WAIT"
+        }
+
+        val agreementRatio = if (activeDirections.isEmpty()) {
+            0.0
+        } else {
+            agreement.toDouble() / activeDirections.size
+        }
+
+        val confidence = (
+            abs(directionalScore) * 0.65 +
+                agreementRatio * 35.0
+        ).toInt().coerceIn(0, 100)
+
+        components.forEach {
+            if (abs(it.score) >= 15.0) {
+                reasons += "${it.name}: ${it.direction} " +
+                    "(${it.score.toInt()})"
+            }
+        }
+
+        if (activeDirections.size >= 2 && agreement < activeDirections.size) {
+            warnings += "Analysis components disagree; confirmation is limited."
+        }
+
+        if (action == "WAIT") {
+            warnings += "Combined directional score is below the trading threshold."
+        }
+
+        return AIAnalysisReport(
+            action = action,
+            confidence = confidence,
+            directionalScore = directionalScore,
+            agreement = agreement,
+            components = components,
+            reasons = reasons,
+            warnings = warnings
+        )
+    }
+
+    private fun component(
+        name: String,
+        score: Double,
+        weight: Double,
+        details: String
+    ): AIComponentScore {
+        val safeScore = score.coerceIn(-100.0, 100.0)
+
+        val direction = when {
+            safeScore > 0.0 -> "BULLISH"
+            safeScore < 0.0 -> "BEARISH"
+            else -> "NEUTRAL"
+        }
+
+        return AIComponentScore(
+            name = name,
+            score = safeScore,
+            weight = weight,
+            contribution = safeScore * weight,
+            direction = direction,
+            details = details
+        )
+    }
+}

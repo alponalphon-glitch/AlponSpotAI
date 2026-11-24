@@ -1,0 +1,184 @@
+package com.alpon.spotai.data
+
+import android.content.Context
+import androidx.room.Dao
+import androidx.room.Database
+import androidx.room.Entity
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.PrimaryKey
+import androidx.room.Query
+import androidx.room.Room
+import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
+
+@Entity(
+    tableName = "market_candles",
+    primaryKeys = ["symbol", "interval", "time"]
+)
+data class MarketCandleEntity(
+    val symbol: String,
+    val interval: String,
+    val time: Long,
+    val open: Double,
+    val high: Double,
+    val low: Double,
+    val close: Double,
+    val volume: Double,
+    val closeTime: Long,
+    val quoteVolume: Double,
+    val tradeCount: Long,
+    val takerBuyBaseVolume: Double,
+    val takerBuyQuoteVolume: Double
+)
+
+
+@Entity(
+    tableName = "history_sync_state",
+    primaryKeys = ["symbol", "interval"]
+)
+data class HistorySyncStateEntity(
+    val symbol: String,
+    val interval: String,
+    val nextStartTime: Long,
+    val isComplete: Boolean,
+    val updatedAt: Long
+)
+
+@Dao
+interface MarketCandleDao {
+
+
+    @Query("""
+        SELECT * FROM history_sync_state
+        WHERE symbol = :symbol AND interval = :interval
+        LIMIT 1
+    """)
+    suspend fun getSyncState(
+        symbol: String,
+        interval: String
+    ): HistorySyncStateEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun saveSyncState(state: HistorySyncStateEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertAll(candles: List<MarketCandleEntity>)
+
+    @Query("""
+        SELECT * FROM market_candles
+        WHERE symbol = :symbol AND interval = :interval
+        ORDER BY time DESC
+        LIMIT :limit
+    """)
+    suspend fun getLatestCandles(
+        symbol: String,
+        interval: String,
+        limit: Int
+    ): List<MarketCandleEntity>
+
+    @Query("""
+        SELECT * FROM market_candles
+        WHERE symbol = :symbol AND interval = :interval
+        AND time >= :fromTime AND time <= :toTime
+        ORDER BY time ASC
+    """)
+    suspend fun getCandlesInRange(
+        symbol: String,
+        interval: String,
+        fromTime: Long,
+        toTime: Long
+    ): List<MarketCandleEntity>
+
+    @Query("""
+        SELECT MIN(time) FROM market_candles
+        WHERE symbol = :symbol AND interval = :interval
+    """)
+    suspend fun getEarliestTime(symbol: String, interval: String): Long?
+
+    @Query("""
+        SELECT MAX(time) FROM market_candles
+        WHERE symbol = :symbol AND interval = :interval
+    """)
+    suspend fun getLatestTime(symbol: String, interval: String): Long?
+
+    @Query("""
+        SELECT COUNT(*) FROM market_candles
+        WHERE symbol = :symbol AND interval = :interval
+    """)
+    suspend fun countCandles(symbol: String, interval: String): Int
+}
+
+@Database(
+    entities = [MarketCandleEntity::class],
+    version = 1,
+    exportSchema = false
+)
+abstract class MarketDatabase : RoomDatabase() {
+
+    abstract fun candleDao(): MarketCandleDao
+
+    companion object {
+
+        private val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS history_sync_state (
+                        symbol TEXT NOT NULL,
+                        interval TEXT NOT NULL,
+                        nextStartTime INTEGER NOT NULL,
+                        isComplete INTEGER NOT NULL,
+                        updatedAt INTEGER NOT NULL,
+                        PRIMARY KEY(symbol, interval)
+                    )
+                """.trimIndent())
+            }
+        }
+
+        @Volatile
+        private var INSTANCE: MarketDatabase? = null
+
+        fun get(context: Context): MarketDatabase {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: Room.databaseBuilder(
+                    context.applicationContext,
+                    MarketDatabase::class.java,
+                    "alpon_market_history.db"
+                ).addMigrations(MIGRATION_1_2)
+                    .build().also { INSTANCE = it }
+            }
+        }
+    }
+}
+
+fun Candle.toEntity(symbol: String, interval: String) =
+    MarketCandleEntity(
+        symbol = symbol,
+        interval = interval,
+        time = time,
+        open = open,
+        high = high,
+        low = low,
+        close = close,
+        volume = volume,
+        closeTime = closeTime,
+        quoteVolume = quoteVolume,
+        tradeCount = tradeCount,
+        takerBuyBaseVolume = takerBuyBaseVolume,
+        takerBuyQuoteVolume = takerBuyQuoteVolume
+    )
+
+fun MarketCandleEntity.toCandle() = Candle(
+    time = time,
+    open = open,
+    high = high,
+    low = low,
+    close = close,
+    volume = volume,
+    closeTime = closeTime,
+    quoteVolume = quoteVolume,
+    tradeCount = tradeCount,
+    takerBuyBaseVolume = takerBuyBaseVolume,
+    takerBuyQuoteVolume = takerBuyQuoteVolume
+)

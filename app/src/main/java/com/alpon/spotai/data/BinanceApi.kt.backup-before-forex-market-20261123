@@ -1,0 +1,167 @@
+package com.alpon.spotai.data
+
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonConverterFactory
+import retrofit2.http.GET
+import retrofit2.http.Query
+
+interface BinanceApi {
+    @GET("api/v3/ticker/24hr")
+    suspend fun tickers(): List<TickerDto>
+
+    @GET("api/v3/exchangeInfo")
+    suspend fun exchangeInfo(): ExchangeInfoDto
+
+    @GET("api/v3/ticker/24hr")
+    suspend fun ticker(@Query("symbol") symbol: String): TickerDto
+
+    @GET("api/v3/klines")
+    suspend fun klines(
+        @Query("symbol") symbol: String,
+        @Query("interval") interval: String,
+        @Query("limit") limit: Int = 1000,
+        @Query("startTime") startTime: Long? = null,
+        @Query("endTime") endTime: Long? = null
+    ): List<List<Any>>
+
+    companion object {
+        fun create(): BinanceApi =
+            Retrofit.Builder()
+                .baseUrl("https://api.binance.com/")
+                .addConverterFactory(GsonConverterFactory.create())
+                .build()
+                .create(BinanceApi::class.java)
+    }
+}
+
+data class TickerDto(
+    val symbol: String,
+    val lastPrice: String,
+    val priceChangePercent: String,
+    val volume: String,
+    val quoteVolume: String
+)
+
+data class ExchangeInfoDto(val symbols: List<ExchangeSymbolDto>)
+
+data class ExchangeSymbolDto(
+    val symbol: String,
+    val status: String,
+    val quoteAsset: String,
+    val isSpotTradingAllowed: Boolean? = null
+)
+
+data class Candle(
+    val time: Long,
+    val open: Double,
+    val high: Double,
+    val low: Double,
+    val close: Double,
+    val volume: Double,
+    val closeTime: Long = 0L,
+    val quoteVolume: Double = 0.0,
+    val tradeCount: Long = 0L,
+    val takerBuyBaseVolume: Double = 0.0,
+    val takerBuyQuoteVolume: Double = 0.0
+)
+
+data class MarketSnapshot(val ticker: TickerDto, val candles: List<Candle>)
+
+class BinanceRepository(private val api: BinanceApi = BinanceApi.create()) {
+    suspend fun ticker(symbol: String) = api.ticker(symbol)
+
+    suspend fun allTickers() = api.tickers()
+
+    suspend fun topSpotUsdtMarkets(limit: Int = 500): List<TickerDto> {
+        val eligible = api.exchangeInfo().symbols.asSequence()
+            .filter {
+                it.status == "TRADING" &&
+                it.quoteAsset == "USDT" &&
+                it.isSpotTradingAllowed != false
+            }
+            .map { it.symbol }
+            .filterNot { symbol ->
+                listOf("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
+                    .any { symbol.endsWith(it) }
+            }
+            .toSet()
+
+        return api.tickers().asSequence()
+            .filter { it.symbol in eligible }
+            .sortedByDescending { it.quoteVolume.toDoubleOrNull() ?: 0.0 }
+            .take(limit.coerceIn(1, 500))
+            .toList()
+    }
+
+    private fun parseCandles(rows: List<List<Any>>): List<Candle> =
+        rows.map { r ->
+            require(r.size >= 12) { "Incomplete Binance kline row: expected 12 fields, received ${r.size}." }
+            fun number(index: Int): Double = r.getOrNull(index)?.toString()?.toDoubleOrNull()
+                ?.takeIf { it.isFinite() }
+                ?: throw IllegalStateException("Invalid Binance kline field at index $index.")
+
+            Candle(
+                time = number(0).toLong(),
+                open = number(1),
+                high = number(2),
+                low = number(3),
+                close = number(4),
+                volume = number(5),
+                closeTime = number(6).toLong(),
+                quoteVolume = number(7),
+                tradeCount = number(8).toLong(),
+                takerBuyBaseVolume = number(9),
+                takerBuyQuoteVolume = number(10)
+            )
+        }
+
+    suspend fun candles(
+        symbol: String,
+        interval: String
+    ): List<Candle> = parseCandles(
+        api.klines(symbol, interval, 1000)
+    )
+
+    suspend fun candlesBefore(
+        symbol: String,
+        interval: String,
+        endTime: Long,
+        limit: Int = 1000
+    ): List<Candle> = parseCandles(
+        api.klines(
+            symbol = symbol,
+            interval = interval,
+            limit = limit.coerceIn(1, 1000),
+            endTime = endTime
+        )
+    )
+
+    suspend fun candlesAfter(
+        symbol: String,
+        interval: String,
+        startTime: Long,
+        limit: Int = 1000
+    ): List<Candle> = parseCandles(
+        api.klines(
+            symbol = symbol,
+            interval = interval,
+            limit = limit.coerceIn(1, 1000),
+            startTime = startTime
+        )
+    )
+
+    suspend fun firstCandle(
+        symbol: String,
+        interval: String
+    ): Candle? = parseCandles(
+        api.klines(
+            symbol = symbol,
+            interval = interval,
+            limit = 1,
+            startTime = 0L
+        )
+    ).firstOrNull()
+
+    suspend fun snapshot(symbol: String, interval: String) =
+        MarketSnapshot(ticker(symbol), candles(symbol, interval))
+}

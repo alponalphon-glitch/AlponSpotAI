@@ -1,0 +1,130 @@
+package com.alpon.spotai.domain
+
+import com.alpon.spotai.data.Candle
+import kotlin.math.abs
+import kotlin.math.sqrt
+
+/** Auditable extensions. Statistical associations are not represented as proven causes or calibrated forecasts. */
+data class CognitiveModuleResult(
+    val name: String,
+    val state: String,
+    val detail: String,
+    val safetyCritical: Boolean = false
+)
+
+data class CognitiveExtensionReport(
+    val modules: List<CognitiveModuleResult>,
+    val blockers: List<String>,
+    val summary: String
+)
+
+object AdvancedCognitiveEngines {
+    fun evaluate(
+        candles: List<Candle>,
+        regime: MarketRegimeReport?,
+        research: NexoraResearchReport,
+        scenario: ScenarioRiskReport,
+        redTeam: RedTeamReport,
+        shock: MarketShockReport,
+        walkForward: WalkForwardResult?,
+        paperOutcomes: List<AdaptiveTradeOutcome>,
+        adaptive: NexoraAdaptiveReport,
+        integrity: DataIntegrityReport,
+        existingBlockers: List<String>
+    ): CognitiveExtensionReport {
+        val closed = candles.asSequence()
+            .filter { it.closeTime > 0L && it.closeTime <= System.currentTimeMillis() && it.close > 0.0 && it.volume >= 0.0 && it.close.isFinite() && it.volume.isFinite() }
+            .sortedBy { it.time }.distinctBy { it.time }.toList().takeLast(600)
+        val returns = closed.zipWithNext { a, b -> b.close / a.close - 1.0 }
+        val volumeChanges = closed.zipWithNext { a, b ->
+            if (a.volume > 0.0) b.volume / a.volume - 1.0 else 0.0
+        }
+        val paired = returns.zip(volumeChanges).filter { it.first.isFinite() && it.second.isFinite() }
+        val correlation = if (paired.size >= 30) {
+            val mx = paired.map { it.first }.average()
+            val my = paired.map { it.second }.average()
+            val cov = paired.sumOf { (it.first - mx) * (it.second - my) }
+            val sx = sqrt(paired.sumOf { (it.first - mx) * (it.first - mx) })
+            val sy = sqrt(paired.sumOf { (it.second - my) * (it.second - my) })
+            if (sx > 1e-12 && sy > 1e-12) (cov / (sx * sy)).coerceIn(-1.0, 1.0) else null
+        } else null
+        val causal = CognitiveModuleResult(
+            "Causal Reasoning Engine",
+            if (correlation != null) "ASSOCIATION MEASURED" else "INSUFFICIENT SAMPLE",
+            "Return/volume-change correlation=${correlation?.let { "%.3f".format(it) } ?: "N/A"}; observational association only, not proof of causation."
+        )
+
+        val momentumPositive = returns.takeLast(5).sum() > 0.0
+        val similar = returns.dropLast(1).takeLast(250).filter { (it > 0.0) == momentumPositive }
+        val observedUp = similar.count { it > 0.0 }
+        val empiricalUp = if (similar.size >= 30) observedUp.toDouble() / similar.size else null
+        val probability = CognitiveModuleResult(
+            "Probabilistic Intelligence",
+            if (empiricalUp != null) "EMPIRICAL BASELINE" else "INSUFFICIENT SAMPLE",
+            "Historical next-bar up frequency in a coarse momentum bucket=${empiricalUp?.let { "%.1f%%".format(it * 100.0) } ?: "N/A"}; n=${similar.size}; uncalibrated and not a forecast."
+        )
+
+        val regimeModule = CognitiveModuleResult(
+            "Market Regime Intelligence",
+            if (regime != null) "REGIME CLASSIFIED" else "REGIME UNAVAILABLE",
+            regime?.let { "${it.regime}; trend=${it.trend}; volatility=${it.volatility}; confidence=${it.confidence}%." }
+                ?: "Market regime report was not supplied."
+        )
+        val adversarialFindings = buildList {
+            if (!redTeam.robust) addAll(redTeam.counterArguments.take(3))
+            if (!shock.safeForNewEntry) addAll(shock.findings.take(3))
+            if (!scenario.sufficientHistory) add("Historical downside stress sample is insufficient.")
+            if (walkForward == null) add("Walk-Forward validation is unavailable.")
+        }
+        val adversarial = CognitiveModuleResult(
+            "Adversarial Simulation",
+            if (adversarialFindings.isEmpty()) "AVAILABLE CHECKS PASSED" else "COUNTER-SCENARIO FOUND",
+            adversarialFindings.joinToString("; ").ifBlank { "Existing red-team, shock, downside-stress and walk-forward checks found no active counter-scenario." },
+            true
+        )
+
+        val validOutcomes = paperOutcomes.filter { it.pnlPercent.isFinite() }
+        val memory = CognitiveModuleResult(
+            "Experience Memory",
+            if (validOutcomes.isNotEmpty()) "PAPER OUTCOMES CONNECTED" else "COLLECTING PAPER OUTCOMES",
+            "${validOutcomes.size} closed paper outcomes supplied; persistence and regime coverage depend on the existing storage pipeline."
+        )
+
+        val portfolio = CognitiveModuleResult(
+            "Portfolio Intelligence",
+            "EXPOSURE DATA REQUIRED",
+            "This decision call has no complete open-position/exposure snapshot; cross-position correlation and aggregate portfolio VaR are not calculated.",
+            true
+        )
+
+        val driftSignals = buildList {
+            if (adaptive.deepLearning.available && !adaptive.deepLearning.acceptedAsEvidence) add("Deep-learning holdout did not qualify as evidence.")
+            if (research.volatilityClusterRatio?.let { it >= 2.5 } == true) add("Realized-volatility behavior has shifted versus its baseline.")
+            if (research.earlyWarnings.isNotEmpty()) addAll(research.earlyWarnings.take(2))
+        }
+        val drift = CognitiveModuleResult(
+            "Model Drift Detection",
+            if (driftSignals.isEmpty() && adaptive.deepLearning.acceptedAsEvidence) "NO CURRENT DRIFT FLAG" else "MONITOR / SHADOW",
+            driftSignals.distinct().joinToString("; ").ifBlank { "No drift flag from available proxy checks; continuous live model-performance monitoring is not connected here." }
+        )
+
+        val metaBlockers = buildList {
+            if (!integrity.valid) add("Meta-decision rejected: market-data integrity is not valid.")
+            if (!redTeam.robust) add("Meta-decision rejected: adversarial counter-evidence remains unresolved.")
+            if (!shock.safeForNewEntry) add("Meta-decision rejected: market-shock guard is active.")
+            if (!scenario.sufficientHistory) add("Meta-decision rejected: downside stress evidence is insufficient.")
+            if (walkForward == null) add("Meta-decision rejected: Walk-Forward evidence is unavailable.")
+            if (existingBlockers.isNotEmpty()) add("Meta-decision retains ${existingBlockers.size} upstream decision blocker(s).")
+        }
+        val meta = CognitiveModuleResult(
+            "Meta-Decision Engine",
+            if (metaBlockers.isEmpty()) "NO NEW META BLOCKER" else "FAIL-CLOSED REVIEW",
+            metaBlockers.joinToString("; ").ifBlank { "No additional meta-level safety blocker; all upstream decision gates remain authoritative." },
+            true
+        )
+
+        val modules = listOf(causal, probability, regimeModule, adversarial, memory, portfolio, drift, meta)
+        val ready = modules.count { it.state in setOf("ASSOCIATION MEASURED", "EMPIRICAL BASELINE", "REGIME CLASSIFIED", "AVAILABLE CHECKS PASSED", "PAPER OUTCOMES CONNECTED", "NO CURRENT DRIFT FLAG", "NO NEW META BLOCKER") }
+        return CognitiveExtensionReport(modules, metaBlockers, "$ready/${modules.size} extension modules have usable evidence; unavailable inputs remain explicitly marked.")
+    }
+}

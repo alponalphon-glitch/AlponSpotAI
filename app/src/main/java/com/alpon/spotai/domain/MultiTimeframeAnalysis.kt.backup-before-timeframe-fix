@@ -1,0 +1,236 @@
+package com.alpon.spotai.domain
+
+import com.alpon.spotai.data.Candle
+import kotlin.math.abs
+import kotlin.math.max
+
+data class TimeframeReading(
+    val label: String,
+    val direction: String,
+    val score: Int,
+    val changePercent: Double,
+    val emaFast: Double,
+    val emaSlow: Double,
+    val rsi: Double,
+    val candles: Int
+)
+
+data class MultiTimeframeSignal(
+    val action: String,
+    val score: Int,
+    val trend: String,
+    val holdingWindow: String,
+    val entry: Double,
+    val stop: Double,
+    val tp1: Double,
+    val tp2: Double,
+    val tp3: Double,
+    val alignment: String,
+    val explanation: String,
+    val readings: List<TimeframeReading>
+)
+
+object MultiTimeframeAnalysis {
+
+    private fun ema(values: List<Double>, period: Int): Double {
+        if (values.size < period) return Double.NaN
+        val k = 2.0 / (period + 1.0)
+        var result = values.take(period).average()
+        for (value in values.drop(period)) {
+            result = value * k + result * (1.0 - k)
+        }
+        return result
+    }
+
+    private fun analyzeFrame(
+        label: String,
+        input: List<Candle>,
+        maxBars: Int
+    ): TimeframeReading? {
+        val candles = input.dropLast(1).takeLast(maxBars)
+        if (candles.size < 25) return null
+
+        val closes = candles.map { it.close }
+        val price = closes.last()
+        if (!price.isFinite() || price <= 0.0) return null
+
+        val fast = ema(closes, 9)
+        val slow = ema(closes, 20)
+        val change = (price / closes.first() - 1.0) * 100.0
+
+        val changes = closes.zipWithNext { a, b -> b - a }.takeLast(14)
+        val gains = changes.sumOf { max(it, 0.0) } / 14.0
+        val losses = changes.sumOf { max(-it, 0.0) } / 14.0
+        val rsi = if (losses == 0.0) 100.0
+                  else 100.0 - 100.0 / (1.0 + gains / losses)
+
+        var points = 0
+        if (fast > slow) points++
+        if (price > slow) points++
+        if (change > 0.0) points++
+        if (rsi > 55.0 && rsi < 75.0) points++
+        if (rsi < 45.0) points--
+
+        val score = (50 + points * 10).coerceIn(0, 100)
+        val direction = when {
+            score >= 60 -> "BULLISH"
+            score <= 40 -> "BEARISH"
+            else -> "NEUTRAL"
+        }
+
+        return TimeframeReading(
+            label = label,
+            direction = direction,
+            score = score,
+            changePercent = change,
+            emaFast = fast,
+            emaSlow = slow,
+            rsi = rsi,
+            candles = candles.size
+        )
+    }
+
+    fun analyze(
+        daily: List<Candle>,
+        hourly: List<Candle>,
+        fifteenMin: List<Candle>,
+        fiveMin: List<Candle>,
+        oneMin: List<Candle>
+    ): MultiTimeframeSignal? {
+
+        val frames = listOfNotNull(
+            analyzeFrame("1Y", daily, 365),
+            analyzeFrame("1M", daily, 30),
+            analyzeFrame("1D", hourly, 48),
+            analyzeFrame("4H", fifteenMin, 32),
+            analyzeFrame("1H", fiveMin, 36),
+            analyzeFrame("15M", oneMin, 30)
+        )
+
+        if (frames.size != 6) return null
+
+        val byName = frames.associateBy { it.label }
+        val weights = mapOf(
+            "1Y" to 0.15,
+            "1M" to 0.20,
+            "1D" to 0.20,
+            "4H" to 0.20,
+            "1H" to 0.15,
+            "15M" to 0.10
+        )
+
+        val weightedScore = frames.sumOf {
+            it.score * (weights[it.label] ?: 0.0)
+        }
+        val score = weightedScore.toInt().coerceIn(0, 100)
+
+        val recent = listOf("1D", "4H", "1H", "15M")
+            .mapNotNull { byName[it] }
+
+        val bullish = recent.count { it.direction == "BULLISH" }
+        val bearish = recent.count { it.direction == "BEARISH" }
+
+        val macroBearish =
+            byName["1Y"]!!.direction == "BEARISH" &&
+            byName["1M"]!!.direction == "BEARISH"
+
+        val macroBullish =
+            byName["1Y"]!!.direction == "BULLISH" &&
+            byName["1M"]!!.direction == "BULLISH"
+
+        val action = when {
+            score >= 60 && bullish >= 3 && !macroBearish -> "BUY"
+            score <= 40 && bearish >= 3 && !macroBullish -> "SELL"
+            else -> "WAIT"
+        }
+
+        val price = oneMin.lastOrNull()?.close
+            ?.takeIf { it.isFinite() && it > 0.0 } ?: return null
+
+        val recentCandles = oneMin.dropLast(1).takeLast(14)
+        val atr = if (recentCandles.size >= 2) {
+            recentCandles.mapIndexed { index, candle ->
+                val previous = recentCandles[index.coerceAtLeast(0)].close
+                max(
+                    candle.high - candle.low,
+                    max(
+                        abs(candle.high - previous),
+                        abs(candle.low - previous)
+                    )
+                )
+            }.average()
+        } else price * 0.005
+
+        val distance = max(atr * 2.0, price * 0.003)
+        val stop = when (action) {
+            "BUY" -> price - distance
+            "SELL" -> price + distance
+            else -> 0.0
+        }
+
+        val risk = if (stop > 0.0) abs(price - stop) else 0.0
+        val tp1 = when (action) {
+            "BUY" -> price + risk
+            "SELL" -> price - risk
+            else -> 0.0
+        }
+        val tp2 = when (action) {
+            "BUY" -> price + risk * 2
+            "SELL" -> price - risk * 2
+            else -> 0.0
+        }
+        val tp3 = when (action) {
+            "BUY" -> price + risk * 3
+            "SELL" -> price - risk * 3
+            else -> 0.0
+        }
+
+        val longTermAligned =
+            byName["1Y"]!!.direction == byName["1M"]!!.direction &&
+            byName["1M"]!!.direction == byName["1D"]!!.direction
+
+        val shortTermAligned = bullish == 4 || bearish == 4
+        val holding = when {
+            action == "WAIT" -> "No trade — wait for confirmation"
+            longTermAligned && shortTermAligned -> "Potentially 1–3 days"
+            shortTermAligned -> "Potentially 4–24 hours"
+            bullish >= 3 || bearish >= 3 -> "Potentially 1–6 hours"
+            else -> "No reliable holding estimate"
+        }
+
+        val alignment = "$bullish bullish / $bearish bearish across 1D–15M"
+
+        val explanation = when (action) {
+            "BUY" ->
+                "Multiple timeframes support upward momentum. " +
+                "For Spot: wait for a confirmed candle close and retest. " +
+                "Do not chase the price."
+            "SELL" ->
+                "Multiple timeframes show downward pressure. " +
+                "For Spot holdings, consider risk reduction or exit. " +
+                "This is not a short-selling instruction."
+            else ->
+                "Timeframes do not agree strongly enough. " +
+                "WAIT for clearer confirmation before entering."
+        }
+
+        return MultiTimeframeSignal(
+            action = action,
+            score = score,
+            trend = when {
+                bullish >= 3 -> "Bullish"
+                bearish >= 3 -> "Bearish"
+                else -> "Mixed"
+            },
+            holdingWindow = holding,
+            entry = if (action == "WAIT") 0.0 else price,
+            stop = stop,
+            tp1 = tp1,
+            tp2 = tp2,
+            tp3 = tp3,
+            alignment = alignment,
+            explanation = explanation,
+            readings = frames
+        )
+    }
+}

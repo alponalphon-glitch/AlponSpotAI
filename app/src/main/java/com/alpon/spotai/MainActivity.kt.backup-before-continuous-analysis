@@ -1,0 +1,379 @@
+package com.alpon.spotai
+
+import android.os.Bundle
+import android.app.Application
+import android.content.Intent
+import android.net.Uri
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.animation.*
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.alpon.spotai.data.*
+import com.alpon.spotai.domain.*
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import java.util.Locale
+
+private val Bg=Color(0xFF080D18); private val Panel=Color(0xFF111B2B); private val Blue=Color(0xFF25A8FF); private val Cyan=Color(0xFF31E0D0); private val Muted=Color(0xFF8D9BB0); private val Green=Color(0xFF20D69A); private val Red=Color(0xFFFF647C)
+class MainActivity:ComponentActivity(){ override fun onCreate(savedInstanceState:Bundle?){super.onCreate(savedInstanceState); window.statusBarColor=android.graphics.Color.rgb(8,13,24); window.navigationBarColor=android.graphics.Color.rgb(8,13,24); setContent { MaterialTheme(colorScheme=darkColorScheme(primary=Blue,background=Bg,surface=Panel)) { SpotApp() } } } }
+data class Holding(val symbol:String,val quantity:Double,val average:Double)
+data class ScanRow(val symbol:String,val price:Double,val change:Double,val signal:Signal)
+class SpotViewModel(app:Application):AndroidViewModel(app){
+    private val repo=BinanceRepository()
+    private val prefs=app.getSharedPreferences("portfolio",0)
+    var symbol by mutableStateOf("BTCUSDT"); private set
+    var interval by mutableStateOf("1h"); private set
+    var ticker by mutableStateOf<TickerDto?>(null); private set
+    var candles by mutableStateOf<List<Candle>>(emptyList()); private set
+    var signal by mutableStateOf<Signal?>(null); private set
+    var loading by mutableStateOf(false); private set
+    var error by mutableStateOf<String?>(null); private set
+    var markets by mutableStateOf<List<TickerDto>>(emptyList()); private set
+    var scanning by mutableStateOf(false); private set
+    var scanRows by mutableStateOf<List<ScanRow>>(emptyList()); private set
+    var holdings by mutableStateOf<List<Holding>>(emptyList()); private set
+    init { holdings = prefs.getString("holdings","")!!.split(";").mapNotNull { row -> val p=row.split("|"); if(p.size==3) runCatching { Holding(p[0],p[1].toDouble(),p[2].toDouble()) }.getOrNull() else null } }
+    var scanInterval by mutableStateOf("1h"); private set
+    fun select(s:String){symbol=s;load()}; fun setInterval(v:String){interval=v;load()}; fun setScanInterval(v:String){scanInterval=v;interval=v;load()}
+    fun load(){ viewModelScope.launch { loading=true;error=null; try { val snap=repo.snapshot(symbol,interval); ticker=snap.ticker;candles=snap.candles;signal=TechnicalAnalysis.analyze(candles,interval); if(signal==null) error="Not enough candle history to calculate all indicators." }catch(e:Exception){error=e.message?:"Unable to load Binance market data."};loading=false } }
+    fun loadMarkets(){viewModelScope.launch {try{markets=repo.allTickers().filter{it.symbol.endsWith("USDT")}.sortedByDescending{it.quoteVolume.toDoubleOrNull()?:0.0}.take(50)}catch(e:Exception){error=e.message?:"Unable to load markets."}}}
+    fun scan(){viewModelScope.launch { scanning=true;scanRows= emptyList();try{val top=repo.allTickers().filter{it.symbol.endsWith("USDT") && !it.symbol.contains("UPUSDT") && !it.symbol.contains("DOWNUSDT")}.sortedByDescending{it.quoteVolume.toDoubleOrNull()?:0.0}.take(25); val rows= mutableListOf<ScanRow>(); for(t in top){ try{val c=repo.candles(t.symbol,scanInterval); val a=TechnicalAnalysis.analyze(c,scanInterval);if(a!=null && a.action!="WAIT") rows.add(ScanRow(t.symbol,t.lastPrice.toDouble(),t.priceChangePercent.toDouble(),a))}catch(_:Exception){}};scanRows=rows.sortedByDescending{it.signal.score} }catch(e:Exception){error=e.message?:"Scanner request failed."};scanning=false } }
+    private fun persistHoldings(){prefs.edit().putString("holdings",holdings.joinToString(";"){"${it.symbol}|${it.quantity}|${it.average}"}).apply()}
+    fun addHolding(h:Holding){holdings=(holdings.filterNot{it.symbol==h.symbol}+h);persistHoldings()}; fun removeHolding(h:Holding){holdings=holdings-h;persistHoldings()}
+    fun currentPrice(s:String)=markets.firstOrNull{it.symbol==s}?.lastPrice?.toDoubleOrNull()
+}
+private data class AppLanguage(val code:String,val name:String)
+private val appLanguages = listOf(
+    AppLanguage("en","English"), AppLanguage("es","Español"), AppLanguage("fr","Français"),
+    AppLanguage("de","Deutsch"), AppLanguage("it","Italiano"), AppLanguage("pt","Português"),
+    AppLanguage("ru","Русский"), AppLanguage("tg","Тоҷикӣ"), AppLanguage("tr","Türkçe"),
+    AppLanguage("ar","العربية"), AppLanguage("zh","中文"), AppLanguage("ja","日本語"),
+    AppLanguage("ko","한국어"), AppLanguage("hi","हिन्दी"), AppLanguage("id","Bahasa Indonesia"),
+    AppLanguage("vi","Tiếng Việt"), AppLanguage("th","ไทย"), AppLanguage("fa","فارسی"),
+    AppLanguage("ur","اردو"), AppLanguage("nl","Nederlands")
+)
+private val translations = mapOf(
+    "es" to mapOf("Home" to "Inicio","Markets" to "Mercados","Scanner" to "Escáner","Portfolio" to "Cartera","Settings" to "Ajustes","My account" to "Mi cuenta","Support" to "Soporte","Language" to "Idioma","Select language" to "Seleccionar idioma","Menu" to "Menú","Account" to "Cuenta","Display name" to "Nombre visible","Save" to "Guardar","Cancel" to "Cancelar","Data source" to "Fuente de datos","Privacy & safety" to "Privacidad y seguridad","About" to "Acerca de","Back" to "Volver","Contact support" to "Contactar con soporte","Premium interface" to "Interfaz premium"),
+    "fr" to mapOf("Home" to "Accueil","Markets" to "Marchés","Scanner" to "Scanner","Portfolio" to "Portefeuille","Settings" to "Paramètres","My account" to "Mon compte","Support" to "Assistance","Language" to "Langue","Select language" to "Choisir la langue","Menu" to "Menu","Account" to "Compte","Display name" to "Nom affiché","Save" to "Enregistrer","Cancel" to "Annuler","Data source" to "Source des données","Privacy & safety" to "Confidentialité et sécurité","About" to "À propos","Back" to "Retour","Contact support" to "Contacter l’assistance","Premium interface" to "Interface premium"),
+    "de" to mapOf("Home" to "Start","Markets" to "Märkte","Scanner" to "Scanner","Portfolio" to "Portfolio","Settings" to "Einstellungen","My account" to "Mein Konto","Support" to "Support","Language" to "Sprache","Select language" to "Sprache auswählen","Menu" to "Menü","Account" to "Konto","Display name" to "Anzeigename","Save" to "Speichern","Cancel" to "Abbrechen","Data source" to "Datenquelle","Privacy & safety" to "Datenschutz & Sicherheit","About" to "Über","Back" to "Zurück","Contact support" to "Support kontaktieren","Premium interface" to "Premium-Oberfläche"),
+    "it" to mapOf("Home" to "Home","Markets" to "Mercati","Scanner" to "Scanner","Portfolio" to "Portafoglio","Settings" to "Impostazioni","My account" to "Il mio account","Support" to "Supporto","Language" to "Lingua","Select language" to "Seleziona lingua","Menu" to "Menu","Account" to "Account","Display name" to "Nome visualizzato","Save" to "Salva","Cancel" to "Annulla","Data source" to "Fonte dati","Privacy & safety" to "Privacy e sicurezza","About" to "Informazioni","Back" to "Indietro","Contact support" to "Contatta il supporto","Premium interface" to "Interfaccia premium"),
+    "pt" to mapOf("Home" to "Início","Markets" to "Mercados","Scanner" to "Scanner","Portfolio" to "Portfólio","Settings" to "Configurações","My account" to "Minha conta","Support" to "Suporte","Language" to "Idioma","Select language" to "Selecionar idioma","Menu" to "Menu","Account" to "Conta","Display name" to "Nome de exibição","Save" to "Salvar","Cancel" to "Cancelar","Data source" to "Fonte de dados","Privacy & safety" to "Privacidade e segurança","About" to "Sobre","Back" to "Voltar","Contact support" to "Contatar suporte","Premium interface" to "Interface premium"),
+    "ru" to mapOf("Home" to "Главная","Markets" to "Рынки","Scanner" to "Сканер","Portfolio" to "Портфель","Settings" to "Настройки","My account" to "Мой аккаунт","Support" to "Поддержка","Language" to "Язык","Select language" to "Выберите язык","Menu" to "Меню","Account" to "Аккаунт","Display name" to "Отображаемое имя","Save" to "Сохранить","Cancel" to "Отмена","Data source" to "Источник данных","Privacy & safety" to "Конфиденциальность и безопасность","About" to "О приложении","Back" to "Назад","Contact support" to "Связаться с поддержкой","Premium interface" to "Премиум-интерфейс"),
+    "tg" to mapOf("Home" to "Асосӣ","Markets" to "Бозорҳо","Scanner" to "Сканер","Portfolio" to "Портфел","Settings" to "Танзимот","My account" to "Ҳисоби ман","Support" to "Дастгирӣ","Language" to "Забон","Select language" to "Интихоби забон","Menu" to "Меню","Account" to "Ҳисоб","Display name" to "Номи намоишӣ","Save" to "Сабт кардан","Cancel" to "Бекор кардан","Data source" to "Манбаи маълумот","Privacy & safety" to "Махфият ва амният","About" to "Дар бораи барнома","Back" to "Бозгашт","Contact support" to "Тамос бо дастгирӣ","Premium interface" to "Интерфейси премиум"),
+    "tr" to mapOf("Home" to "Ana Sayfa","Markets" to "Piyasalar","Scanner" to "Tarayıcı","Portfolio" to "Portföy","Settings" to "Ayarlar","My account" to "Hesabım","Support" to "Destek","Language" to "Dil","Select language" to "Dil seçin","Menu" to "Menü","Account" to "Hesap","Display name" to "Görünen ad","Save" to "Kaydet","Cancel" to "İptal","Data source" to "Veri kaynağı","Privacy & safety" to "Gizlilik ve güvenlik","About" to "Hakkında","Back" to "Geri","Contact support" to "Destek ile iletişim","Premium interface" to "Premium arayüz"),
+    "ar" to mapOf("Home" to "الرئيسية","Markets" to "الأسواق","Scanner" to "الماسح","Portfolio" to "المحفظة","Settings" to "الإعدادات","My account" to "حسابي","Support" to "الدعم","Language" to "اللغة","Select language" to "اختر اللغة","Menu" to "القائمة","Account" to "الحساب","Display name" to "اسم العرض","Save" to "حفظ","Cancel" to "إلغاء","Data source" to "مصدر البيانات","Privacy & safety" to "الخصوصية والأمان","About" to "حول","Back" to "رجوع","Contact support" to "اتصل بالدعم","Premium interface" to "واجهة مميزة"),
+    "zh" to mapOf("Home" to "首页","Markets" to "市场","Scanner" to "扫描器","Portfolio" to "投资组合","Settings" to "设置","My account" to "我的账户","Support" to "支持","Language" to "语言","Select language" to "选择语言","Menu" to "菜单","Account" to "账户","Display name" to "显示名称","Save" to "保存","Cancel" to "取消","Data source" to "数据来源","Privacy & safety" to "隐私与安全","About" to "关于","Back" to "返回","Contact support" to "联系支持","Premium interface" to "高级界面"),
+    "ja" to mapOf("Home" to "ホーム","Markets" to "市場","Scanner" to "スキャナー","Portfolio" to "ポートフォリオ","Settings" to "設定","My account" to "マイアカウント","Support" to "サポート","Language" to "言語","Select language" to "言語を選択","Menu" to "メニュー","Account" to "アカウント","Display name" to "表示名","Save" to "保存","Cancel" to "キャンセル","Data source" to "データソース","Privacy & safety" to "プライバシーと安全","About" to "アプリについて","Back" to "戻る","Contact support" to "サポートに連絡","Premium interface" to "プレミアム画面"),
+    "ko" to mapOf("Home" to "홈","Markets" to "시장","Scanner" to "스캐너","Portfolio" to "포트폴리오","Settings" to "설정","My account" to "내 계정","Support" to "지원","Language" to "언어","Select language" to "언어 선택","Menu" to "메뉴","Account" to "계정","Display name" to "표시 이름","Save" to "저장","Cancel" to "취소","Data source" to "데이터 소스","Privacy & safety" to "개인정보 및 보안","About" to "정보","Back" to "뒤로","Contact support" to "지원팀 문의","Premium interface" to "프리미엄 인터페이스"),
+    "hi" to mapOf("Home" to "होम","Markets" to "बाज़ार","Scanner" to "स्कैनर","Portfolio" to "पोर्टफोलियो","Settings" to "सेटिंग्स","My account" to "मेरा खाता","Support" to "सहायता","Language" to "भाषा","Select language" to "भाषा चुनें","Menu" to "मेनू","Account" to "खाता","Display name" to "प्रदर्शित नाम","Save" to "सहेजें","Cancel" to "रद्द करें","Data source" to "डेटा स्रोत","Privacy & safety" to "गोपनीयता और सुरक्षा","About" to "जानकारी","Back" to "वापस","Contact support" to "सहायता से संपर्क करें","Premium interface" to "प्रीमियम इंटरफ़ेस"),
+    "id" to mapOf("Home" to "Beranda","Markets" to "Pasar","Scanner" to "Pemindai","Portfolio" to "Portofolio","Settings" to "Pengaturan","My account" to "Akun saya","Support" to "Dukungan","Language" to "Bahasa","Select language" to "Pilih bahasa","Menu" to "Menu","Account" to "Akun","Display name" to "Nama tampilan","Save" to "Simpan","Cancel" to "Batal","Data source" to "Sumber data","Privacy & safety" to "Privasi & keamanan","About" to "Tentang","Back" to "Kembali","Contact support" to "Hubungi dukungan","Premium interface" to "Antarmuka premium"),
+    "vi" to mapOf("Home" to "Trang chủ","Markets" to "Thị trường","Scanner" to "Bộ quét","Portfolio" to "Danh mục","Settings" to "Cài đặt","My account" to "Tài khoản của tôi","Support" to "Hỗ trợ","Language" to "Ngôn ngữ","Select language" to "Chọn ngôn ngữ","Menu" to "Menu","Account" to "Tài khoản","Display name" to "Tên hiển thị","Save" to "Lưu","Cancel" to "Hủy","Data source" to "Nguồn dữ liệu","Privacy & safety" to "Quyền riêng tư và bảo mật","About" to "Giới thiệu","Back" to "Quay lại","Contact support" to "Liên hệ hỗ trợ","Premium interface" to "Giao diện cao cấp"),
+    "th" to mapOf("Home" to "หน้าหลัก","Markets" to "ตลาด","Scanner" to "สแกนเนอร์","Portfolio" to "พอร์ต","Settings" to "การตั้งค่า","My account" to "บัญชีของฉัน","Support" to "ช่วยเหลือ","Language" to "ภาษา","Select language" to "เลือกภาษา","Menu" to "เมนู","Account" to "บัญชี","Display name" to "ชื่อที่แสดง","Save" to "บันทึก","Cancel" to "ยกเลิก","Data source" to "แหล่งข้อมูล","Privacy & safety" to "ความเป็นส่วนตัวและความปลอดภัย","About" to "เกี่ยวกับ","Back" to "กลับ","Contact support" to "ติดต่อฝ่ายช่วยเหลือ","Premium interface" to "อินเทอร์เฟซพรีเมียม"),
+    "fa" to mapOf("Home" to "خانه","Markets" to "بازارها","Scanner" to "اسکنر","Portfolio" to "سبد دارایی","Settings" to "تنظیمات","My account" to "حساب من","Support" to "پشتیبانی","Language" to "زبان","Select language" to "انتخاب زبان","Menu" to "منو","Account" to "حساب","Display name" to "نام نمایشی","Save" to "ذخیره","Cancel" to "لغو","Data source" to "منبع داده","Privacy & safety" to "حریم خصوصی و امنیت","About" to "درباره","Back" to "بازگشت","Contact support" to "تماس با پشتیبانی","Premium interface" to "رابط پریمیوم"),
+    "ur" to mapOf("Home" to "ہوم","Markets" to "مارکیٹس","Scanner" to "اسکینر","Portfolio" to "پورٹ فولیو","Settings" to "ترتیبات","My account" to "میرا اکاؤنٹ","Support" to "مدد","Language" to "زبان","Select language" to "زبان منتخب کریں","Menu" to "مینو","Account" to "اکاؤنٹ","Display name" to "ظاہری نام","Save" to "محفوظ کریں","Cancel" to "منسوخ","Data source" to "ڈیٹا کا ذریعہ","Privacy & safety" to "رازداری اور تحفظ","About" to "تعارف","Back" to "واپس","Contact support" to "مدد سے رابطہ کریں","Premium interface" to "پریمیم انٹرفیس"),
+    "nl" to mapOf("Home" to "Start","Markets" to "Markten","Scanner" to "Scanner","Portfolio" to "Portfolio","Settings" to "Instellingen","My account" to "Mijn account","Support" to "Ondersteuning","Language" to "Taal","Select language" to "Kies taal","Menu" to "Menu","Account" to "Account","Display name" to "Weergavenaam","Save" to "Opslaan","Cancel" to "Annuleren","Data source" to "Gegevensbron","Privacy & safety" to "Privacy en veiligheid","About" to "Over","Back" to "Terug","Contact support" to "Contact opnemen","Premium interface" to "Premium-interface")
+)
+private fun tr(key:String,language:String):String = translations[language]?.get(key) ?: key
+
+@Composable fun SpotApp(vm:SpotViewModel= viewModel()) {
+    val context= LocalContext.current
+    val prefs= remember { context.getSharedPreferences("app_preferences",0) }
+    var language by remember { mutableStateOf(prefs.getString("language","en") ?: "en") }
+    var tab by remember { mutableStateOf("Home") }
+    var menuOpen by remember { mutableStateOf(false) }
+    var page by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit){vm.load();vm.loadMarkets()}
+    val nav=listOf("Home" to Icons.Default.Home,"Markets" to Icons.Default.ShowChart,"Scanner" to Icons.Default.Radar,"Portfolio" to Icons.Default.AccountBalanceWallet,"Settings" to Icons.Default.Settings)
+    Scaffold(containerColor=Bg,bottomBar={
+        if(page==null) NavigationBar(containerColor=Panel,contentColor=Muted,modifier=Modifier.heightIn(min=62.dp)) {
+            nav.forEach{(name,icon)->val label=tr(name,language);NavigationBarItem(selected=tab==name,onClick={tab=name;if(name=="Markets")vm.loadMarkets();if(name=="Scanner")vm.scan()},icon={Icon(icon,null)},label={Text(label,fontSize=10.sp,maxLines=1)},colors=NavigationBarItemDefaults.colors(selectedIconColor=Cyan,selectedTextColor=Cyan,indicatorColor=Blue.copy(alpha=.14f),unselectedIconColor=Muted,unselectedTextColor=Muted))}
+        }
+    }) { pad ->
+        Column(Modifier.fillMaxSize().padding(pad).padding(horizontal=14.dp)) {
+            Row(Modifier.fillMaxWidth().padding(top=8.dp,bottom=12.dp),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically) {
+                Row(verticalAlignment=Alignment.CenterVertically) {
+                    if(page!=null) IconButton(onClick={page=null},modifier=Modifier.size(34.dp)) { Icon(Icons.Default.ArrowBack,null,tint=Cyan) }
+                    Column { Text("ALPON",fontSize=11.sp,color=Cyan,fontWeight=FontWeight.Bold,letterSpacing=3.sp);Text("SPOT AI",fontSize=22.sp,color=Color.White,fontWeight=FontWeight.ExtraBold) }
+                }
+                Row(verticalAlignment=Alignment.CenterVertically) {
+                    Box(Modifier.size(7.dp).background(Green,CircleShape));Spacer(Modifier.width(6.dp));Text("BINANCE SPOT",fontSize=9.sp,color=Muted)
+                    Box {
+                        IconButton(onClick={menuOpen=true},modifier=Modifier.size(42.dp)) { Icon(Icons.Default.Menu,tr("Menu",language),tint=Cyan) }
+                        DropdownMenu(expanded=menuOpen,onDismissRequest={menuOpen=false},modifier=Modifier.background(Brush.linearGradient(listOf(Color(0xFF1B3552),Color(0xFF0B1423))),RoundedCornerShape(18.dp))) {
+                            listOf("My account" to Icons.Default.Person,"Settings" to Icons.Default.Settings,"Support" to Icons.Default.SupportAgent).forEach { (label,icon)->
+                                DropdownMenuItem(text={Text(tr(label,language),color=Color.White,fontWeight=FontWeight.SemiBold)},leadingIcon={Icon(icon,null,tint=Cyan)},onClick={menuOpen=false;page=label})
+                            }
+                        }
+                    }
+                }
+            }
+            when {
+                page=="My account" -> AccountScreen(language)
+                page=="Settings" -> SettingsScreen(language){newLang->language=newLang;prefs.edit().putString("language",newLang).apply()}
+                page=="Support" -> SupportScreen(language)
+                else -> when(tab){"Home"->HomeScreen(vm);"Markets"->MarketsScreen(vm){tab="Home"};"Scanner"->ScannerScreen(vm){tab="Home"};"Portfolio"->PortfolioScreen(vm);else->SettingsScreen(language){newLang->language=newLang;prefs.edit().putString("language",newLang).apply()}}
+            }
+        }
+    }
+}
+@Composable fun CardBox(content:@Composable ColumnScope.()->Unit){
+    Column(Modifier.fillMaxWidth().padding(bottom=12.dp).shadow(16.dp,RoundedCornerShape(20.dp)).background(Brush.linearGradient(listOf(Color(0xFF1A2B43),Color(0xFF101A2B),Color(0xFF0D1524))),RoundedCornerShape(20.dp)).padding(15.dp),content=content)
+}
+@Composable fun Section(title:String,tail:String?=null){Row(Modifier.fillMaxWidth().padding(bottom=12.dp),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically){Text(title,color=Color.White,fontWeight=FontWeight.Bold,fontSize=16.sp);if(tail!=null)Text(tail,color=Muted,fontSize=11.sp)}}
+@Composable fun HomeScreen(vm:SpotViewModel){
+    var pair by remember(vm.symbol){mutableStateOf(vm.symbol)}
+    LazyColumn(contentPadding=PaddingValues(bottom=16.dp)){
+        item{CardBox{Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically){Column{Text("SELECTED MARKET",color=Muted,fontSize=10.sp);Text(pair,color=Color.White,fontSize=18.sp,fontWeight=FontWeight.Bold)};IconButton(onClick={vm.load()}){Icon(Icons.Default.Refresh,null,tint=Cyan)}};val t=vm.ticker;Text(t?.lastPrice?.toDoubleOrNull()?.let{fmt(it)}?:"—",fontSize=31.sp,color=Color.White,fontWeight=FontWeight.Bold);Text(t?.priceChangePercent?.let{"${if((it.toDoubleOrNull()?:0.0)>=0)"+" else ""}$it% (24h)"}?:"Waiting for market data",color=if((t?.priceChangePercent?.toDoubleOrNull()?:0.0)>=0)Green else Red);Text("24h quote volume  ${t?.quoteVolume?.toDoubleOrNull()?.let{compact(it)} ?: "—"} USDT",color=Muted,fontSize=11.sp);Spacer(Modifier.height(8.dp));Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){listOf("BTCUSDT","ETHUSDT","SOLUSDT").forEach{FilterChip(selected=pair==it,onClick={pair=it;vm.select(it)},label={Text(it)})}}}}
+        item{Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically){Text("PRICE CHART",color=Color.White,fontWeight=FontWeight.Bold);Row(Modifier.horizontalScroll(rememberScrollState())){listOf("15m","1h","4h","1d").forEach{FilterChip(selected=vm.interval==it,onClick={vm.setInterval(it)},label={Text(it,fontSize=10.sp)})}}}}
+        item{CardBox{if(vm.candles.isNotEmpty())CandleChart(vm.candles) else Box(Modifier.fillMaxWidth().height(190.dp),contentAlignment=Alignment.Center){Text(if(vm.loading)"Loading candles…" else "Chart unavailable",color=Muted)}}}
+        item{if(vm.loading)LinearProgressIndicator(Modifier.fillMaxWidth(),color=Cyan);vm.error?.let{Text(it,color=Red,fontSize=12.sp,modifier=Modifier.padding(bottom=10.dp))}}
+        item{Section("AI MARKET ANALYSIS","Rule-based • Live data") ; val s=vm.signal; if(s==null)CardBox{Text("Analysis unavailable",color=Muted)}else CardBox{Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically){Text(s.action,fontSize=25.sp,fontWeight=FontWeight.ExtraBold,color=when(s.action){"BUY"->Green;"SELL"->Red;else->Cyan});Text("${s.score}/100",fontSize=18.sp,color=Color.White,fontWeight=FontWeight.Bold)};Text("${s.trend} trend",color=Muted);Spacer(Modifier.height(10.dp));Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween){Metric("Entry",fmt(s.entry));Metric("Stop loss",fmt(s.stop));Metric("R:R", "1:${s.rr}")};Spacer(Modifier.height(12.dp));Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween){Metric("Take profit 1",fmt(s.tp1));Metric("TP 2",fmt(s.tp2));Metric("TP 3",fmt(s.tp3))};HorizontalDivider(Modifier.padding(vertical=10.dp),color=Muted.copy(alpha=.2f));Text(s.explanation,color=Muted,fontSize=12.sp);Text("Indicators",color=Color.White,fontWeight=FontWeight.Bold,modifier=Modifier.padding(top=12.dp,bottom=7.dp));Text("EMA 9  ${fmt(s.ema9)}   EMA 21  ${fmt(s.ema21)}",color=Muted,fontSize=11.sp);Text("EMA 50  ${fmt(s.ema50)}   EMA 200  ${fmt(s.ema200)}",color=Muted,fontSize=11.sp);Text("RSI  ${"%.1f".format(s.rsi)}   MACD  ${"%.5f".format(s.macd)}",color=Muted,fontSize=11.sp);Text("Support  ${fmt(s.support)}   Resistance  ${fmt(s.resistance)}",color=Muted,fontSize=11.sp)}}
+        item{Text("Analysis only. No orders are placed. Signals are not financial advice.",color=Muted,fontSize=10.sp,modifier=Modifier.padding(bottom=10.dp))}
+    }
+}
+@Composable fun Metric(label:String,value:String){Column{Text(label,color=Muted,fontSize=10.sp);Text(value,color=Color.White,fontSize=12.sp,fontWeight=FontWeight.SemiBold)}}
+@Composable fun CandleChart(c:List<Candle>){Canvas(Modifier.fillMaxWidth().height(205.dp)){val data=c.takeLast(65);if(data.isEmpty())return@Canvas;val lo=data.minOf{it.low};val hi=data.maxOf{it.high};val range=(hi-lo).coerceAtLeast(.0000001);val step=size.width/data.size;for(i in 0..4){val y=size.height*i/4;drawLine(Muted.copy(alpha=.15f),Offset(0f,y),Offset(size.width,y),1f)};data.forEachIndexed{i,v->val x=step*(i+.5f);val y={p:Double->size.height*.78f-((p-lo)/range*size.height*.76f).toFloat()};val up=v.close>=v.open;val color=if(up)Green else Red;drawLine(color.copy(alpha=.22f),Offset(x,y(v.high)),Offset(x,y(v.low)),5f);drawLine(color,Offset(x,y(v.high)),Offset(x,y(v.low)),1.5f);val top=y(maxOf(v.open,v.close));val bottom=y(minOf(v.open,v.close));drawLine(color.copy(alpha=.22f),Offset(x,top),Offset(x,bottom.coerceAtLeast(top+2f)),(step*.9f).coerceAtLeast(4f),StrokeCap.Square);drawLine(color,Offset(x,top),Offset(x,bottom.coerceAtLeast(top+2f)),(step*.55f).coerceAtLeast(2f),StrokeCap.Square);val maxVol=data.maxOf{it.volume}.coerceAtLeast(1.0);val vh=(v.volume/maxVol*size.height*.18f).toFloat();drawLine(color.copy(alpha=.38f),Offset(x,size.height-1f),Offset(x,size.height-vh), (step*.55f).coerceAtLeast(1f))}}}
+@Composable fun MarketsScreen(vm:SpotViewModel,onOpen:()->Unit){var query by remember{mutableStateOf("")};Column{OutlinedTextField(query,{query=it},Modifier.fillMaxWidth(),placeholder={Text("Search trading pair")},singleLine=true);Spacer(Modifier.height(10.dp));Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween){Text("TOP SPOT MARKETS",color=Color.White,fontWeight=FontWeight.Bold);Text("24h change",color=Muted,fontSize=11.sp)};LazyColumn{items(vm.markets.filter{it.symbol.contains(query.uppercase())}){t->Row(Modifier.fillMaxWidth().clickable{vm.select(t.symbol);onOpen()}.padding(vertical=12.dp),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically){Column{Text(t.symbol,color=Color.White,fontWeight=FontWeight.Bold);Text("Vol ${compact(t.quoteVolume.toDoubleOrNull()?:0.0)} USDT",color=Muted,fontSize=10.sp)};Column(horizontalAlignment=Alignment.End){Text(fmt(t.lastPrice.toDoubleOrNull()?:0.0),color=Color.White);val ch=t.priceChangePercent.toDoubleOrNull()?:0.0;Text("${if(ch>0)"+" else ""}${"%.2f".format(ch)}%",color=if(ch>=0)Green else Red,fontSize=12.sp)}};HorizontalDivider(color=Muted.copy(alpha=.15f))}}}}
+@Composable fun ScannerScreen(vm:SpotViewModel,onOpen:()->Unit){
+    var lowerTab by remember { mutableStateOf("Chart") }
+    LaunchedEffect(vm.symbol,vm.scanInterval) { while(true) { vm.load(); delay(15_000) } }
+    Column(Modifier.fillMaxSize()) {
+        Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically){
+            Column { Text("LIVE MARKET SCANNER",color=Color.White,fontWeight=FontWeight.ExtraBold,fontSize=17.sp); Text("Binance Spot • Live market feed",color=Muted,fontSize=10.sp) }
+            IconButton(onClick={vm.load();vm.scan()}) { Icon(Icons.Default.Refresh,null,tint=Cyan) }
+        }
+        CardBox {
+            Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically){
+                Column { Text("SELECTED PAIR",color=Muted,fontSize=9.sp,letterSpacing=1.sp); Text(vm.symbol,color=Color.White,fontSize=20.sp,fontWeight=FontWeight.ExtraBold) }
+                val t=vm.ticker
+                Column(horizontalAlignment=Alignment.End){ Text(t?.lastPrice?.toDoubleOrNull()?.let{fmt(it)}?:"—",color=Color.White,fontSize=18.sp,fontWeight=FontWeight.Bold); val ch=t?.priceChangePercent?.toDoubleOrNull()?:0.0; Text("${if(ch>=0)"+" else ""}${"%.2f".format(ch)}%",color=if(ch>=0)Green else Red,fontSize=12.sp,fontWeight=FontWeight.Bold) }
+            }
+            Spacer(Modifier.height(10.dp))
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(6.dp)) { listOf("1m","5m","15m","1h","4h","1d").forEach { tf -> FilterChip(selected=vm.scanInterval==tf,onClick={vm.setScanInterval(tf)},label={Text(tf,fontSize=10.sp)}) } }
+            Box(Modifier.fillMaxWidth().height(224.dp).background(Color(0xFF091321),RoundedCornerShape(14.dp)).padding(8.dp),contentAlignment=Alignment.Center){
+                if(vm.candles.isNotEmpty()) CandleChart(vm.candles) else Text(if(vm.loading)"Loading live Binance candles…" else "Chart data unavailable",color=Muted,fontSize=12.sp)
+            }
+            Spacer(Modifier.height(10.dp))
+            // Three-position control: chart is intentionally the first/default view.
+            Row(Modifier.fillMaxWidth().background(Color(0xFF091321),RoundedCornerShape(14.dp)).padding(4.dp),horizontalArrangement=Arrangement.spacedBy(4.dp)){
+                listOf("Chart","Analysis","Scanner").forEach { label ->
+                    Box(Modifier.weight(1f).background(if(lowerTab==label)Brush.horizontalGradient(listOf(Blue,Cyan)) else Brush.horizontalGradient(listOf(Color.Transparent,Color.Transparent)),RoundedCornerShape(10.dp)).clickable{lowerTab=label}.padding(vertical=9.dp),contentAlignment=Alignment.Center){Text(label,color=if(lowerTab==label)Color(0xFF06111E) else Muted,fontSize=11.sp,fontWeight=FontWeight.Bold)}
+                }
+            }
+        }
+        when(lowerTab){
+            "Chart" -> { Section("LIVE CANDLESTICK CHART","Green / red candles"); Text("Candles and prices are loaded from Binance Spot. Tap a market below to switch the chart.",color=Muted,fontSize=10.sp,modifier=Modifier.padding(bottom=8.dp)) }
+            "Analysis" -> {
+                val a=vm.signal
+                Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+                    Section("TRADE PLAN & RISK CONTROL",a?.action ?: "UNAVAILABLE")
+                    if(a==null) Text("Analysis unavailable until enough verified Binance candles are received.",color=Muted,fontSize=11.sp)
+                    else {
+                        var capital by remember { mutableStateOf("1000") }
+                        var riskPct by remember { mutableStateOf("1") }
+                        val balance=capital.toDoubleOrNull()?.takeIf{it>0}
+                        val riskPercent=riskPct.toDoubleOrNull()?.takeIf{it>0&&it<=100}
+                        val riskCash=if(balance!=null&&riskPercent!=null)balance*riskPercent/100.0 else null
+                        val unitRisk=kotlin.math.abs(a.entry-a.stop)
+                        val quantity=if(a.action=="BUY"&&riskCash!=null&&unitRisk>0)riskCash/unitRisk else null
+                        CardBox {
+                            Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically){
+                                Text(a.action,color=when(a.action){"BUY"->Green;"SELL"->Red;else->Cyan},fontSize=25.sp,fontWeight=FontWeight.ExtraBold)
+                                Text("Confidence ${a.score}/100",color=Color.White,fontWeight=FontWeight.Bold)
+                            }
+                            Text("${a.trend} • ${a.bullishVotes} bullish / ${a.bearishVotes} bearish / ${a.neutralVotes} neutral",color=Muted,fontSize=11.sp)
+                            HorizontalDivider(Modifier.padding(vertical=10.dp),color=Muted.copy(alpha=.2f))
+                            Text("ENTRY & EXIT LEVELS",color=Cyan,fontWeight=FontWeight.Bold,fontSize=11.sp)
+                            Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween){Metric("Reference entry",fmt(a.entry));Metric("Stop loss",fmt(a.stop));Metric("Risk / reward","1:${a.rr}")}
+                            Spacer(Modifier.height(12.dp))
+                            Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween){Metric("Take profit 1",fmt(a.tp1));Metric("Take profit 2",fmt(a.tp2));Metric("Take profit 3",fmt(a.tp3))}
+                            Spacer(Modifier.height(12.dp))
+                            Text("${a.entryTiming}",color=Color.White,fontSize=12.sp)
+                            Text(a.holdingWindow,color=Cyan,fontSize=11.sp,modifier=Modifier.padding(top=6.dp))
+                            Text(a.candleCloseAt,color=Muted,fontSize=10.sp,modifier=Modifier.padding(top=4.dp))
+                        }
+                        CardBox {
+                            Text("MONEY MANAGEMENT",color=Cyan,fontWeight=FontWeight.Bold,fontSize=13.sp)
+                            Text("Set your own account balance and maximum risk per trade. These values stay on this device only.",color=Muted,fontSize=10.sp)
+                            Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                                OutlinedTextField(capital,{capital=it},Modifier.weight(1f),label={Text("Account (USDT)")},singleLine=true,keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Decimal))
+                                OutlinedTextField(riskPct,{riskPct=it},Modifier.weight(1f),label={Text("Risk (%)")},singleLine=true,keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Decimal))
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween){Metric("Risk amount",riskCash?.let{fmt(it)+" USDT"}?:"—");Metric("Position size",quantity?.let{fmt(it)+" units"}?:"—")}
+                            Text(quantity?.let{"Estimated notional: ${fmt(it*a.entry)} USDT"}?:"Enter a valid balance and risk percentage to calculate position size.",color=Muted,fontSize=10.sp,modifier=Modifier.padding(top=7.dp))
+                            Text("Risk is calculated from entry-to-stop distance. Fees, slippage, liquidity and gaps can increase actual loss. Never risk money you cannot afford to lose.",color=Red,fontSize=10.sp,modifier=Modifier.padding(top=8.dp))
+                        }
+                        CardBox {
+                            Text("100+ TECHNICAL CHECKS",color=Cyan,fontWeight=FontWeight.Bold,fontSize=13.sp)
+                            Text("${a.indicators.size} calculated readings • ${a.indicators.map{it.group}.distinct().size} analysis groups",color=Muted,fontSize=10.sp)
+                            a.indicators.forEach { item ->
+                                Row(Modifier.fillMaxWidth().padding(vertical=4.dp),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically){
+                                    Column(Modifier.weight(1f)){Text(item.name,color=Color.White,fontSize=10.sp);Text(item.group,color=Muted,fontSize=9.sp)}
+                                    Text(item.value,color=Color.White,fontSize=10.sp)
+                                    Text(when(item.bias){1->"BULL";-1->"BEAR";else->"NEUTRAL"},color=when(item.bias){1->Green;-1->Red;else->Muted},fontSize=9.sp,fontWeight=FontWeight.Bold,modifier=Modifier.width(58.dp))
+                                }
+                                HorizontalDivider(color=Muted.copy(alpha=.12f))
+                            }
+                        }
+                        Text(a.explanation,color=Muted,fontSize=10.sp,modifier=Modifier.padding(bottom=12.dp))
+                    }
+                }
+            }
+            else -> {
+                Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically){Text("SCAN OPPORTUNITIES",color=Color.White,fontWeight=FontWeight.Bold,fontSize=15.sp); Button(onClick={vm.scan()},enabled=!vm.scanning,contentPadding=PaddingValues(horizontal=10.dp,vertical=4.dp)){Text(if(vm.scanning)"Scanning…" else "Scan",fontSize=10.sp)}}
+                if(vm.scanning) LinearProgressIndicator(Modifier.fillMaxWidth(),color=Cyan)
+                if(!vm.scanning && vm.scanRows.isEmpty()) Text("No qualified opportunities yet. Run a scan to refresh.",color=Muted,fontSize=11.sp,modifier=Modifier.padding(vertical=8.dp))
+                LazyColumn(Modifier.weight(1f).padding(top=4.dp)) { items(vm.scanRows) { r ->
+                    CardBox { Row(Modifier.fillMaxWidth().clickable { vm.select(r.symbol);lowerTab="Chart" },horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically){ Column { Text(r.symbol,color=Color.White,fontWeight=FontWeight.Bold);Text(fmt(r.price),color=Muted,fontSize=11.sp) };Column(horizontalAlignment=Alignment.End){Text(r.signal.action,color=if(r.signal.action=="BUY")Green else Red,fontWeight=FontWeight.Bold);Text("Score ${r.signal.score} • ${"%.2f".format(r.change)}%",color=Muted,fontSize=10.sp)} } }
+                } }
+            }
+        }
+        if(vm.loading) LinearProgressIndicator(Modifier.fillMaxWidth(),color=Cyan)
+        vm.error?.let { Text(it,color=Red,fontSize=10.sp,modifier=Modifier.padding(top=4.dp,bottom=6.dp)) }
+    }
+}
+@Composable fun PortfolioScreen(vm:SpotViewModel) {
+    var show by remember { mutableStateOf(false) }
+    var sym by remember { mutableStateOf("BTCUSDT") }
+    var qty by remember { mutableStateOf("") }
+    var avg by remember { mutableStateOf("") }
+    val total = vm.holdings.sumOf { (vm.currentPrice(it.symbol) ?: 0.0) * it.quantity }
+    Column(Modifier.fillMaxSize()) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement=Arrangement.SpaceBetween, verticalAlignment=Alignment.CenterVertically) {
+            Text("YOUR PORTFOLIO", color=Color.White, fontWeight=FontWeight.Bold)
+            Button(onClick={show=true}) { Icon(Icons.Default.Add,null); Text(" Add asset") }
+        }
+        CardBox {
+            Text("TOTAL VALUE",color=Muted,fontSize=10.sp)
+            Text(fmt(total),color=Color.White,fontSize=29.sp,fontWeight=FontWeight.Bold)
+            Text("USDT • Based on latest available prices",color=Muted,fontSize=10.sp)
+        }
+        if(vm.holdings.isEmpty()) {
+            Text("No assets yet. Add a holding to track your portfolio.",color=Muted)
+        } else {
+            LazyColumn(Modifier.weight(1f)) {
+                items(vm.holdings) { h ->
+                    val price=vm.currentPrice(h.symbol)
+                    val value=(price ?: 0.0)*h.quantity
+                    val pnl=price?.let { (it-h.average)*h.quantity }
+                    CardBox {
+                        Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically) {
+                            Column { Text(h.symbol,color=Color.White,fontWeight=FontWeight.Bold); Text("${h.quantity} units • Avg ${fmt(h.average)}",color=Muted,fontSize=11.sp) }
+                            Column(horizontalAlignment=Alignment.End) {
+                                Text(price?.let{fmt(value)} ?: "Price unavailable",color=Color.White,fontWeight=FontWeight.Bold)
+                                Text(pnl?.let { "${if(it>=0)"+" else ""}${fmt(it)} USDT" } ?: "P/L unavailable",color=if((pnl ?: 0.0)>=0)Green else Red,fontSize=11.sp)
+                            }
+                        }
+                        TextButton(onClick={vm.removeHolding(h)}) { Text("Remove",color=Red) }
+                    }
+                }
+            }
+        }
+    }
+    if(show) AlertDialog(
+        onDismissRequest={show=false}, title={Text("Add portfolio asset")},
+        text={Column {
+            OutlinedTextField(sym,{sym=it.uppercase()},label={Text("Trading pair")})
+            OutlinedTextField(qty,{qty=it},label={Text("Quantity")},keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Decimal))
+            OutlinedTextField(avg,{avg=it},label={Text("Average purchase price (USDT)")},keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Decimal))
+        }},
+        confirmButton={TextButton(onClick={val q=qty.toDoubleOrNull();val a=avg.toDoubleOrNull();if(sym.endsWith("USDT")&&q!=null&&q>0&&a!=null&&a>0){vm.addHolding(Holding(sym,q,a));show=false}}){Text("Save")}},
+        dismissButton={TextButton(onClick={show=false}){Text("Cancel")}}
+    )
+}
+@Composable fun SettingsScreen(language:String,onLanguageChange:(String)->Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        Section(tr("Settings",language),tr("Premium interface",language))
+        CardBox {
+            Text(tr("Language",language),color=Color.White,fontWeight=FontWeight.Bold,fontSize=14.sp)
+            Spacer(Modifier.height(8.dp))
+            Box {
+                OutlinedButton(onClick={expanded=true},modifier=Modifier.fillMaxWidth()) {
+                    Text(appLanguages.firstOrNull{it.code==language}?.name ?: "English",color=Color.White)
+                    Spacer(Modifier.weight(1f));Icon(Icons.Default.ExpandMore,null,tint=Cyan)
+                }
+                DropdownMenu(expanded=expanded,onDismissRequest={expanded=false},modifier=Modifier.heightIn(max=360.dp).background(Panel)) {
+                    appLanguages.forEach { lang -> DropdownMenuItem(text={Text(lang.name,color=Color.White)},onClick={expanded=false;onLanguageChange(lang.code)}) }
+                }
+            }
+            Text("20 interface languages. Your selection is saved on this device.",color=Muted,fontSize=10.sp,modifier=Modifier.padding(top=8.dp))
+        }
+        CardBox {
+            Text(tr("Data source",language),color=Color.White,fontWeight=FontWeight.Bold)
+            Text("Binance Spot public REST API",color=Muted,fontSize=12.sp)
+            Spacer(Modifier.height(14.dp))
+            Text(tr("Privacy & safety",language),color=Color.White,fontWeight=FontWeight.Bold)
+            Text("No API key is required. This app does not place trades, access private accounts, or submit orders.",color=Muted,fontSize=12.sp)
+            Spacer(Modifier.height(14.dp))
+            Text(tr("About",language),color=Color.White,fontWeight=FontWeight.Bold)
+            Text("Alpon Spot AI • Version 1.0.0",color=Muted,fontSize=12.sp)
+            Text("Technical indicators and scanner signals are rule-based analysis, not guaranteed outcomes or financial advice.",color=Muted,fontSize=12.sp)
+        }
+    }
+}
+@Composable fun AccountScreen(language:String) {
+    val context=LocalContext.current
+    val prefs= remember { context.getSharedPreferences("app_preferences",0) }
+    var displayName by remember { mutableStateOf(prefs.getString("display_name","") ?: "") }
+    var saved by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        Section(tr("My account",language),"LOCAL PROFILE")
+        CardBox {
+            Box(Modifier.size(62.dp).background(Brush.linearGradient(listOf(Blue,Cyan)),CircleShape),contentAlignment=Alignment.Center) { Icon(Icons.Default.Person,null,tint=Color(0xFF071321),modifier=Modifier.size(34.dp)) }
+            Spacer(Modifier.height(12.dp))
+            Text(tr("Display name",language),color=Muted,fontSize=11.sp)
+            OutlinedTextField(value=displayName,onValueChange={displayName=it;saved=false},modifier=Modifier.fillMaxWidth(),singleLine=true,placeholder={Text("Your name")})
+            Button(onClick={prefs.edit().putString("display_name",displayName.trim()).apply();saved=true},modifier=Modifier.fillMaxWidth()) { Text(tr("Save",language)) }
+            if(saved) Text("Profile saved on this device.",color=Green,fontSize=11.sp)
+            Text("This is a local app profile. No exchange account is connected and no Binance credentials are stored.",color=Muted,fontSize=11.sp)
+        }
+    }
+}
+@Composable fun SupportScreen(language:String) {
+    val context=LocalContext.current
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        Section(tr("Support",language),"ALPON SPOT AI")
+        CardBox {
+            Icon(Icons.Default.SupportAgent,null,tint=Cyan,modifier=Modifier.size(42.dp))
+            Text(tr("Contact support",language),color=Color.White,fontWeight=FontWeight.Bold,fontSize=16.sp)
+            Text("For app questions and technical assistance, open the Alpon support Telegram channel.",color=Muted,fontSize=12.sp)
+            Button(onClick={runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://t.me/alpon_alphon"))) }},modifier=Modifier.fillMaxWidth()) { Icon(Icons.Default.Send,null);Spacer(Modifier.width(8.dp));Text("Open Telegram support") }
+        }
+    }
+}
+fun fmt(v:Double):String=if(!v.isFinite())"—" else String.format(Locale.US,"%,.4f",v).trimEnd('0').trimEnd('.')
+fun compact(v:Double)=when{v>=1e9->"%.2fB".format(v/1e9);v>=1e6->"%.2fM".format(v/1e6);v>=1e3->"%.2fK".format(v/1e3);else->"%.0f".format(v)}

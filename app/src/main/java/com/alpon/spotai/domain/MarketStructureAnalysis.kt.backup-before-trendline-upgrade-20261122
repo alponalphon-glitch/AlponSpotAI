@@ -1,0 +1,289 @@
+package com.alpon.spotai.domain
+
+import com.alpon.spotai.data.Candle
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+
+data class SwingPoint(
+    val index: Int,
+    val time: Long,
+    val price: Double,
+    val type: String
+)
+
+data class PriceLevel(
+    val price: Double,
+    val type: String,
+    val strength: Int
+)
+
+data class TrendLine(
+    val startTime: Long,
+    val startPrice: Double,
+    val endTime: Long,
+    val endPrice: Double,
+    val type: String
+) {
+    fun priceAt(time: Long): Double {
+        val duration = endTime - startTime
+        if (duration == 0L) return endPrice
+        val progress = (time - startTime).toDouble() / duration.toDouble()
+        return startPrice + (endPrice - startPrice) * progress
+    }
+}
+
+data class FairValueGap(
+    val type: String,
+    val low: Double,
+    val high: Double,
+    val time: Long
+)
+
+data class StructureEvent(
+    val name: String,
+    val direction: String,
+    val price: Double,
+    val time: Long
+)
+
+data class MarketStructureReport(
+    val trend: String,
+    val swingPoints: List<SwingPoint>,
+    val support: List<PriceLevel>,
+    val resistance: List<PriceLevel>,
+    val trendLines: List<TrendLine>,
+    val fairValueGaps: List<FairValueGap>,
+    val events: List<StructureEvent>,
+    val liquiditySweep: String
+)
+
+object MarketStructureAnalysis {
+
+    fun analyze(
+        candles: List<Candle>,
+        pivotRadius: Int = 3
+    ): MarketStructureReport? {
+        if (candles.size < 20) return null
+
+        val data = candles.sortedBy { it.time }
+        val radius = pivotRadius.coerceIn(2, 10)
+        val swings = findSwings(data, radius)
+
+        val highs = swings.filter { it.type == "HIGH" }
+        val lows = swings.filter { it.type == "LOW" }
+
+        val trend = detectTrend(highs, lows)
+        val support = buildLevels(lows, "SUPPORT", data.last().close)
+        val resistance = buildLevels(highs, "RESISTANCE", data.last().close)
+
+        val lines = buildTrendLines(highs, lows)
+        val gaps = findFairValueGaps(data)
+        val events = findStructureEvents(data, highs, lows, trend)
+        val sweep = detectLiquiditySweep(data.last(), highs, lows)
+
+        return MarketStructureReport(
+            trend = trend,
+            swingPoints = swings,
+            support = support,
+            resistance = resistance,
+            trendLines = lines,
+            fairValueGaps = gaps,
+            events = events,
+            liquiditySweep = sweep
+        )
+    }
+
+    private fun findSwings(
+        candles: List<Candle>,
+        radius: Int
+    ): List<SwingPoint> {
+        val result = mutableListOf<SwingPoint>()
+
+        for (i in radius until candles.size - radius) {
+            val current = candles[i]
+            val left = candles.subList(i - radius, i)
+            val right = candles.subList(i + 1, i + radius + 1)
+
+            val isHigh = left.all { current.high > it.high } &&
+                right.all { current.high >= it.high }
+
+            val isLow = left.all { current.low < it.low } &&
+                right.all { current.low <= it.low }
+
+            if (isHigh) {
+                result.add(SwingPoint(i, current.time, current.high, "HIGH"))
+            }
+            if (isLow) {
+                result.add(SwingPoint(i, current.time, current.low, "LOW"))
+            }
+        }
+
+        return result.sortedBy { it.index }
+    }
+
+    private fun detectTrend(
+        highs: List<SwingPoint>,
+        lows: List<SwingPoint>
+    ): String {
+        if (highs.size < 2 || lows.size < 2) return "SIDEWAYS"
+
+        val higherHigh = highs.last().price > highs[highs.lastIndex - 1].price
+        val higherLow = lows.last().price > lows[lows.lastIndex - 1].price
+        val lowerHigh = highs.last().price < highs[highs.lastIndex - 1].price
+        val lowerLow = lows.last().price < lows[lows.lastIndex - 1].price
+
+        return when {
+            higherHigh && higherLow -> "BULLISH"
+            lowerHigh && lowerLow -> "BEARISH"
+            else -> "SIDEWAYS"
+        }
+    }
+
+    private fun buildLevels(
+        points: List<SwingPoint>,
+        type: String,
+        currentPrice: Double
+    ): List<PriceLevel> {
+        if (points.isEmpty()) return emptyList()
+
+        val tolerance = currentPrice * 0.003
+        val clusters = mutableListOf<MutableList<SwingPoint>>()
+
+        points.sortedBy { it.price }.forEach { point ->
+            val cluster = clusters.lastOrNull()
+            if (cluster != null &&
+                abs(cluster.map { it.price }.average() - point.price) <= tolerance
+            ) {
+                cluster.add(point)
+            } else {
+                clusters.add(mutableListOf(point))
+            }
+        }
+
+        return clusters.map { cluster ->
+            PriceLevel(
+                price = cluster.map { it.price }.average(),
+                type = type,
+                strength = cluster.size
+            )
+        }.sortedBy {
+            abs(it.price - currentPrice)
+        }.take(8)
+    }
+
+    private fun buildTrendLines(
+        highs: List<SwingPoint>,
+        lows: List<SwingPoint>
+    ): List<TrendLine> {
+        val result = mutableListOf<TrendLine>()
+
+        if (lows.size >= 2) {
+            val a = lows[lows.lastIndex - 1]
+            val b = lows.last()
+            result.add(
+                TrendLine(a.time, a.price, b.time, b.price, "SUPPORT_TRENDLINE")
+            )
+        }
+
+        if (highs.size >= 2) {
+            val a = highs[highs.lastIndex - 1]
+            val b = highs.last()
+            result.add(
+                TrendLine(a.time, a.price, b.time, b.price, "RESISTANCE_TRENDLINE")
+            )
+        }
+
+        return result
+    }
+
+    private fun findFairValueGaps(
+        candles: List<Candle>
+    ): List<FairValueGap> {
+        val result = mutableListOf<FairValueGap>()
+
+        for (i in 2 until candles.size) {
+            val first = candles[i - 2]
+            val third = candles[i]
+
+            if (third.low > first.high) {
+                result.add(
+                    FairValueGap(
+                        "BULLISH",
+                        first.high,
+                        third.low,
+                        third.time
+                    )
+                )
+            } else if (third.high < first.low) {
+                result.add(
+                    FairValueGap(
+                        "BEARISH",
+                        third.high,
+                        first.low,
+                        third.time
+                    )
+                )
+            }
+        }
+
+        return result.takeLast(30)
+    }
+
+    private fun findStructureEvents(
+        candles: List<Candle>,
+        highs: List<SwingPoint>,
+        lows: List<SwingPoint>,
+        trend: String
+    ): List<StructureEvent> {
+        val last = candles.last()
+        val events = mutableListOf<StructureEvent>()
+        val previousHigh = highs.lastOrNull()
+        val previousLow = lows.lastOrNull()
+
+        if (previousHigh != null && last.close > previousHigh.price) {
+            events.add(
+                StructureEvent(
+                    if (trend == "BEARISH") "BULLISH_CHOCH" else "BULLISH_BOS",
+                    "BULLISH",
+                    last.close,
+                    last.time
+                )
+            )
+        }
+
+        if (previousLow != null && last.close < previousLow.price) {
+            events.add(
+                StructureEvent(
+                    if (trend == "BULLISH") "BEARISH_CHOCH" else "BEARISH_BOS",
+                    "BEARISH",
+                    last.close,
+                    last.time
+                )
+            )
+        }
+
+        return events
+    }
+
+    private fun detectLiquiditySweep(
+        last: Candle,
+        highs: List<SwingPoint>,
+        lows: List<SwingPoint>
+    ): String {
+        val high = highs.lastOrNull()
+        val low = lows.lastOrNull()
+
+        return when {
+            high != null &&
+                last.high > high.price &&
+                last.close < high.price -> "BUY_SIDE_LIQUIDITY_SWEEP"
+
+            low != null &&
+                last.low < low.price &&
+                last.close > low.price -> "SELL_SIDE_LIQUIDITY_SWEEP"
+
+            else -> "NONE"
+        }
+    }
+}

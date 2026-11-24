@@ -1,0 +1,146 @@
+package com.alpon.spotai.domain
+
+import com.alpon.spotai.data.Candle
+import kotlin.math.abs
+import kotlin.math.max
+
+data class MarketRegimeReport(
+    val regime: String,
+    val trend: String,
+    val volatility: String,
+    val atrPercent: Double,
+    val volatilityRatio: Double,
+    val adx: Double,
+    val efficiencyRatio: Double,
+    val confidence: Int,
+    val explanation: String
+)
+
+object MarketRegimeAnalysis {
+
+    fun analyze(input: List<Candle>): MarketRegimeReport? {
+        val candles = input
+            .filter { it.close > 0.0 && it.high >= it.low }
+            .dropLast(1)
+            .takeLast(80)
+
+        if (candles.size < 40) return null
+
+        val close = candles.last().close
+        if (!close.isFinite() || close <= 0.0) return null
+
+        val ranges = candles.mapIndexed { i, candle ->
+            val previousClose = candles[(i - 1).coerceAtLeast(0)].close
+            max(
+                candle.high - candle.low,
+                max(
+                    abs(candle.high - previousClose),
+                    abs(candle.low - previousClose)
+                )
+            )
+        }
+
+        val recentAtr = ranges.takeLast(14).average()
+        val baselineAtr = ranges.dropLast(14).average()
+
+        if (!recentAtr.isFinite() || recentAtr <= 0.0 ||
+            !baselineAtr.isFinite() || baselineAtr <= 0.0
+        ) return null
+
+        val atrPercent = recentAtr / close * 100.0
+        val volatilityRatio = recentAtr / baselineAtr
+
+        val directional = candles.takeLast(15)
+        var plusDm = 0.0
+        var minusDm = 0.0
+        var trueRange = 0.0
+
+        for (i in 1 until directional.size) {
+            val current = directional[i]
+            val previous = directional[i - 1]
+
+            val upMove = current.high - previous.high
+            val downMove = previous.low - current.low
+
+            plusDm += if (upMove > downMove && upMove > 0.0) upMove else 0.0
+            minusDm += if (downMove > upMove && downMove > 0.0) downMove else 0.0
+
+            trueRange += max(
+                current.high - current.low,
+                max(
+                    abs(current.high - previous.close),
+                    abs(current.low - previous.close)
+                )
+            )
+        }
+
+        val plusDi = if (trueRange > 0.0) plusDm / trueRange * 100.0 else 0.0
+        val minusDi = if (trueRange > 0.0) minusDm / trueRange * 100.0 else 0.0
+
+        val adx = if (plusDi + minusDi > 0.0) {
+            abs(plusDi - minusDi) / (plusDi + minusDi) * 100.0
+        } else {
+            0.0
+        }
+
+        val firstClose = candles[candles.lastIndex - 14].close
+        val netMove = abs(close - firstClose)
+        val totalMove = candles.takeLast(15)
+            .zipWithNext { a, b -> abs(b.close - a.close) }
+            .sum()
+
+        val efficiencyRatio = if (totalMove > 0.0) {
+            (netMove / totalMove).coerceIn(0.0, 1.0)
+        } else {
+            0.0
+        }
+
+        val trend = when {
+            adx >= 20.0 && efficiencyRatio >= 0.35 && plusDi > minusDi -> "BULLISH"
+            adx >= 20.0 && efficiencyRatio >= 0.35 && minusDi > plusDi -> "BEARISH"
+            else -> "SIDEWAYS"
+        }
+
+        val volatility = when {
+            volatilityRatio >= 1.5 -> "HIGH"
+            volatilityRatio <= 0.65 -> "LOW"
+            else -> "NORMAL"
+        }
+
+        val regime = when {
+            volatility == "HIGH" -> "HIGH VOLATILITY"
+            volatility == "LOW" -> "LOW VOLATILITY"
+            trend != "SIDEWAYS" -> "TRENDING"
+            else -> "RANGING"
+        }
+
+        val confidence = when {
+            volatility == "HIGH" -> (50 + (volatilityRatio - 1.5) * 30).toInt()
+            trend != "SIDEWAYS" -> (50 + adx * 0.4 + efficiencyRatio * 20).toInt()
+            else -> (60 + (1.0 - efficiencyRatio) * 30).toInt()
+        }.coerceIn(0, 95)
+
+        val explanation = when (regime) {
+            "HIGH VOLATILITY" ->
+                "Volatility is elevated; reduce risk and avoid chasing price."
+            "LOW VOLATILITY" ->
+                "Volatility is compressed; wait for a confirmed breakout."
+            "TRENDING" ->
+                "$trend trend detected; look for entries aligned with market direction."
+            else ->
+                "Market is ranging; trend-following signals need extra confirmation."
+        }
+
+        return MarketRegimeReport(
+            regime = regime,
+            trend = trend,
+            volatility = volatility,
+            atrPercent = atrPercent,
+            volatilityRatio = volatilityRatio,
+            adx = adx,
+            efficiencyRatio = efficiencyRatio,
+            confidence = confidence,
+            explanation = explanation
+        )
+    }
+}

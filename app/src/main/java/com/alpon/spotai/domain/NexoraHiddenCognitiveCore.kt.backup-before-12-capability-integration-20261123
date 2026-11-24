@@ -1,0 +1,67 @@
+package com.alpon.spotai.domain
+
+/**
+ * Internal-only cognitive control layer. It is deliberately not exposed to menu/UI models.
+ * Uses existing evidence; it does not claim to be an LLM or a newly trained neural network.
+ */
+data class HiddenCognitiveCoreReport(
+    val allowed: Boolean,
+    val blockers: List<String>,
+    val internalAudit: List<String>
+)
+
+object NexoraHiddenCognitiveCore {
+    fun evaluate(
+        proposedAction: String?,
+        regime: MarketRegimeReport?,
+        mtf: MultiTimeframeSignal?,
+        unified: UnifiedBrainReport,
+        integrity: DataIntegrityReport,
+        redTeam: RedTeamReport,
+        shock: MarketShockReport,
+        paperOutcomes: List<AdaptiveTradeOutcome>
+    ): HiddenCognitiveCoreReport {
+        val action = proposedAction?.uppercase() ?: "WAIT"
+        val blockers = mutableListOf<String>()
+        val audit = mutableListOf<String>()
+        val isDirectional = action == "BUY" || action == "SELL"
+        val target = if (action == "BUY") "BULLISH" else "BEARISH"
+
+        // 1) Scenario reasoning + multi-timeframe contradiction detection.
+        val readings = mtf?.readings.orEmpty().filter { it.direction in setOf("BULLISH", "BEARISH") }
+        val opposing = readings.count { it.direction != target }
+        val aligned = readings.count { it.direction == target }
+        audit += "Scenario reasoning: action=$action, unifiedScore=${unified.directionalScore}, alignedFrames=$aligned, opposingFrames=$opposing, sample=${readings.size}."
+        if (isDirectional && readings.size >= 7 && opposing >= 5 && opposing > aligned) {
+            blockers += "Hidden cognitive core: strong multi-timeframe counter-evidence ($opposing opposing vs $aligned aligned); WAIT for alignment."
+        }
+
+        // 2) Experience memory: only sufficiently sampled closed paper outcomes are used.
+        val regimeKey = regime?.regime?.uppercase()
+        val regimeHistory = paperOutcomes.filter {
+            it.pnlPercent.isFinite() && (regimeKey == null || it.regime.equals(regimeKey, ignoreCase = true))
+        }.takeLast(30)
+        if (regimeHistory.size >= 12) {
+            val winRate = regimeHistory.count { it.pnlPercent > 0.0 } * 100.0 / regimeHistory.size
+            val average = regimeHistory.map { it.pnlPercent }.average()
+            audit += "Experience memory: regime=${regimeKey ?: "ALL"}, n=${regimeHistory.size}, winRate=${"%.1f".format(winRate)}%, avg=${"%.3f".format(average)}%."
+            if (isDirectional && winRate < 40.0 && average <= 0.0) {
+                blockers += "Hidden experience memory: this market regime has weak paper results (n=${regimeHistory.size}); pause new entries and review the setup."
+            }
+        } else {
+            audit += "Experience memory: insufficient regime-matched closed paper outcomes; no learning claim made."
+        }
+
+        // 3) Skeptic / anomaly review. Existing authoritative guards remain fail-closed.
+        if (isDirectional && !integrity.valid) blockers += "Hidden anomaly review: market data integrity failed."
+        if (isDirectional && !redTeam.robust) blockers += "Hidden skeptic review: unresolved adversarial counter-evidence."
+        if (isDirectional && !shock.safeForNewEntry) blockers += "Hidden shock review: market-shock circuit breaker is active."
+        audit += "Safety review: integrity=${integrity.valid}, redTeam=${redTeam.robust}, shockSafe=${shock.safeForNewEntry}."
+
+        // 4) Confidence discipline: no numeric confidence is promoted to a probability here.
+        audit += "Confidence calibration: empirical outcomes are contextual evidence only; no calibrated probability supplied."
+        audit += "Execution policy: analysis/Paper Trading gates remain authoritative; this core never sends exchange orders."
+
+        return HiddenCognitiveCoreReport(blockers.isEmpty(), blockers.distinct(), audit)
+    }
+}

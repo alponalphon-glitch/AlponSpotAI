@@ -1,0 +1,183 @@
+package com.alpon.spotai.domain
+
+import com.alpon.spotai.data.Candle
+import kotlin.math.abs
+import kotlin.math.max
+
+data class MarketRegimeReport(
+    val regime: String,
+    val trend: String,
+    val volatility: String,
+    val atrPercent: Double,
+    val volatilityRatio: Double,
+    val adx: Double,
+    val trendStrength: String,
+    val efficiencyRatio: Double,
+    val confidence: Int,
+    val explanation: String
+)
+
+object MarketRegimeAnalysis {
+
+    fun analyze(input: List<Candle>): MarketRegimeReport? {
+        val candles = input
+            .filter { it.close > 0.0 && it.high >= it.low }
+            .dropLast(1)
+            .takeLast(80)
+
+        if (candles.size < 40) return null
+
+        val close = candles.last().close
+        if (!close.isFinite() || close <= 0.0) return null
+
+        val ranges = candles.mapIndexed { i, candle ->
+            val previousClose = candles[(i - 1).coerceAtLeast(0)].close
+            max(
+                candle.high - candle.low,
+                max(
+                    abs(candle.high - previousClose),
+                    abs(candle.low - previousClose)
+                )
+            )
+        }
+
+        val recentAtr = ranges.takeLast(14).average()
+        val baselineAtr = ranges.dropLast(14).average()
+
+        if (!recentAtr.isFinite() || recentAtr <= 0.0 ||
+            !baselineAtr.isFinite() || baselineAtr <= 0.0
+        ) return null
+
+        val atrPercent = recentAtr / close * 100.0
+        val volatilityRatio = recentAtr / baselineAtr
+
+        // Wilder DMI/ADX (14): smoothed TR, +DM and -DM, then smoothed DX.
+        val period = 14
+        val trValues = mutableListOf<Double>()
+        val plusDmValues = mutableListOf<Double>()
+        val minusDmValues = mutableListOf<Double>()
+
+        for (i in 1 until candles.size) {
+            val current = candles[i]
+            val previous = candles[i - 1]
+
+            val upMove = current.high - previous.high
+            val downMove = previous.low - current.low
+
+            plusDmValues += if (upMove > downMove && upMove > 0.0) upMove else 0.0
+            minusDmValues += if (downMove > upMove && downMove > 0.0) downMove else 0.0
+            trValues += max(
+                current.high - current.low,
+                max(
+                    abs(current.high - previous.close),
+                    abs(current.low - previous.close)
+                )
+            )
+        }
+
+        if (trValues.size < period * 2) return null
+
+        var smoothedTr = trValues.take(period).sum()
+        var smoothedPlusDm = plusDmValues.take(period).sum()
+        var smoothedMinusDm = minusDmValues.take(period).sum()
+        val dxValues = mutableListOf<Double>()
+
+        fun addDx() {
+            if (smoothedTr <= 0.0) return
+            val plusDiNow = smoothedPlusDm / smoothedTr * 100.0
+            val minusDiNow = smoothedMinusDm / smoothedTr * 100.0
+            val denominator = plusDiNow + minusDiNow
+            if (denominator > 0.0) {
+                dxValues += abs(plusDiNow - minusDiNow) / denominator * 100.0
+            }
+        }
+
+        addDx()
+
+        for (i in period until trValues.size) {
+            smoothedTr = smoothedTr - smoothedTr / period + trValues[i]
+            smoothedPlusDm = smoothedPlusDm - smoothedPlusDm / period + plusDmValues[i]
+            smoothedMinusDm = smoothedMinusDm - smoothedMinusDm / period + minusDmValues[i]
+            addDx()
+        }
+
+        if (dxValues.size < period) return null
+
+        var adx = dxValues.take(period).average()
+        for (i in period until dxValues.size) {
+            adx = (adx * (period - 1) + dxValues[i]) / period
+        }
+
+        val plusDi = if (smoothedTr > 0.0) smoothedPlusDm / smoothedTr * 100.0 else 0.0
+        val minusDi = if (smoothedTr > 0.0) smoothedMinusDm / smoothedTr * 100.0 else 0.0
+
+        val firstClose = candles[candles.lastIndex - 14].close
+        val netMove = abs(close - firstClose)
+        val totalMove = candles.takeLast(15)
+            .zipWithNext { a, b -> abs(b.close - a.close) }
+            .sum()
+
+        val efficiencyRatio = if (totalMove > 0.0) {
+            (netMove / totalMove).coerceIn(0.0, 1.0)
+        } else {
+            0.0
+        }
+
+        val trendStrength = when {
+            adx < 15.0 -> "VERY WEAK"
+            adx < 20.0 -> "WEAK"
+            adx < 25.0 -> "DEVELOPING"
+            adx <= 40.0 -> "STRONG"
+            else -> "VERY STRONG"
+        }
+
+        val trend = when {
+            adx >= 20.0 && efficiencyRatio >= 0.35 && plusDi > minusDi -> "BULLISH"
+            adx >= 20.0 && efficiencyRatio >= 0.35 && minusDi > plusDi -> "BEARISH"
+            else -> "SIDEWAYS"
+        }
+
+        val volatility = when {
+            volatilityRatio >= 1.5 -> "HIGH"
+            volatilityRatio <= 0.65 -> "LOW"
+            else -> "NORMAL"
+        }
+
+        val regime = when {
+            volatility == "HIGH" -> "HIGH VOLATILITY"
+            volatility == "LOW" -> "LOW VOLATILITY"
+            trend != "SIDEWAYS" -> "TRENDING"
+            else -> "RANGING"
+        }
+
+        val confidence = when {
+            volatility == "HIGH" -> (50 + (volatilityRatio - 1.5) * 30).toInt()
+            trend != "SIDEWAYS" -> (50 + adx * 0.4 + efficiencyRatio * 20).toInt()
+            else -> (60 + (1.0 - efficiencyRatio) * 30).toInt()
+        }.coerceIn(0, 95)
+
+        val explanation = when (regime) {
+            "HIGH VOLATILITY" ->
+                "Volatility is elevated; reduce risk and avoid chasing price."
+            "LOW VOLATILITY" ->
+                "Volatility is compressed; wait for a confirmed breakout."
+            "TRENDING" ->
+                "$trend trend detected; look for entries aligned with market direction."
+            else ->
+                "Market is ranging; trend-following signals need extra confirmation."
+        }
+
+        return MarketRegimeReport(
+            regime = regime,
+            trend = trend,
+            volatility = volatility,
+            atrPercent = atrPercent,
+            volatilityRatio = volatilityRatio,
+            adx = adx,
+            trendStrength = trendStrength,
+            efficiencyRatio = efficiencyRatio,
+            confidence = confidence,
+            explanation = explanation
+        )
+    }
+}

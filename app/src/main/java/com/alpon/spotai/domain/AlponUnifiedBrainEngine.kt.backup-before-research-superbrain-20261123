@@ -1,0 +1,112 @@
+package com.alpon.spotai.domain
+
+import com.alpon.spotai.data.ExternalMarketContext
+import kotlin.math.abs
+
+/** One explainable synthesis layer for ALPON's existing analysis engines.
+ * Scores are evidence-strength heuristics, not probabilities or trained-model outputs.
+ */
+data class BrainEvidence(
+    val module: String,
+    val direction: String,
+    val score: Double,
+    val weight: Double,
+    val detail: String
+)
+
+data class UnifiedBrainReport(
+    val direction: String,
+    val directionalScore: Double,
+    val confidence: Int,
+    val evidenceCount: Int,
+    val coverage: String,
+    val status: String,
+    val evidence: List<BrainEvidence>,
+    val conflicts: List<String>,
+    val warnings: List<String>,
+    val blockers: List<String>
+)
+
+object AlponUnifiedBrainEngine {
+    private fun direction(score: Double): String = when {
+        score >= 15.0 -> "BULLISH"
+        score <= -15.0 -> "BEARISH"
+        else -> "NEUTRAL"
+    }
+
+    fun synthesize(
+        technical: Signal?,
+        mtf: MultiTimeframeSignal?,
+        structure: MarketStructureReport?,
+        regime: MarketRegimeReport?,
+        priceAction: PriceActionReport?,
+        smartMoney: SmartMoneyReport?,
+        ensemble: TechnicalEnsembleReport?,
+        cognitive: CognitiveIntelligenceReport?,
+        derivatives: FuturesDerivativesReport?,
+        external: ExternalMarketContext?,
+        learning: AdaptiveLearningDecision?,
+        walkForward: WalkForwardResult?,
+        technicalQuality: TechnicalQualityReport? = null
+    ): UnifiedBrainReport {
+        val evidence = mutableListOf<BrainEvidence>()
+        fun add(name: String, raw: Double?, weight: Double, detail: String) {
+            if (raw != null && raw.isFinite()) evidence += BrainEvidence(name, direction(raw), raw.coerceIn(-100.0, 100.0), weight, detail)
+        }
+        add("Independent technical quality", technicalQuality?.takeIf { it.available }?.score, 1.15, technicalQuality?.let { "${it.direction} • ADX ${it.trendStrength?.let { v -> "%.1f".format(v) } ?: "N/A"} • ${it.breakout} • ${it.candlePattern}" } ?: "Unavailable")
+        add("Technical indicators", technical?.let { val total = it.bullishVotes + it.bearishVotes; if (total > 0) (it.bullishVotes - it.bearishVotes) * 100.0 / total else 0.0 }, 1.0, technical?.let { "${it.bullishVotes} bullish / ${it.bearishVotes} bearish votes; ${it.action}" } ?: "Unavailable")
+        add("Multi-timeframe", mtf?.let { (it.score - 50) * 2.0 }, 1.25, mtf?.let { "${it.readings.size} frames • ${it.alignment}" } ?: "Unavailable")
+        add("Market structure", structure?.let { when(it.trend.uppercase()) { "BULLISH" -> 55.0; "BEARISH" -> -55.0; else -> 0.0 } + (it.events.takeLast(4).sumOf { e -> when(e.direction.uppercase()) { "BULLISH" -> 8.0; "BEARISH" -> -8.0; else -> 0.0 } }) }, 1.15, structure?.let { "${it.trend} • ${it.events.size} structure events • ${it.liquiditySweep}" } ?: "Unavailable")
+        add("Market regime", regime?.let { when(it.trend.uppercase()) { "BULLISH" -> 55.0; "BEARISH" -> -55.0; else -> 0.0 } }, 0.9, regime?.let { "${it.regime} • ${it.volatility} volatility • ADX ${"%.1f".format(it.adx)}" } ?: "Unavailable")
+        val horizon = priceAction?.twoYearTrend ?: priceAction?.yearlyTrend ?: priceAction?.monthlyTrend
+        add("Long-horizon price action", horizon?.score, 1.0, horizon?.let { "${it.label} • ${it.structure}" } ?: "1–2 year context unavailable")
+        add("Smart Money / liquidity", smartMoney?.score, 1.0, smartMoney?.let { "${it.bias} • ${it.breakoutQuality}" } ?: "Unavailable")
+        add("Parameter ensemble", ensemble?.directionalScore, 0.9, ensemble?.let { "${it.configurationCount} parameter configurations • ${it.familyScores.size} families" } ?: "Unavailable")
+        add("Cognitive liquidity", cognitive?.liquidity?.let { when(it.bias.uppercase()) { "BUY-SIDE PRESSURE", "BULLISH" -> 25.0; "SELL-SIDE PRESSURE", "BEARISH" -> -25.0; else -> 0.0 } }, 0.55, cognitive?.liquidity?.let { "${it.bias} • ${it.nearestPool}" } ?: "Unavailable")
+        add("Futures positioning", derivatives?.takeIf { it.available && it.blockers.isEmpty() }?.directionalScore?.toDouble(), 0.8, derivatives?.let { "${it.directionalBias} • ${it.riskLevel} positioning risk" } ?: "Not available / not applicable")
+        if (external?.verificationReady == true) {
+            val newsScore = ((external.bullishNews - external.bearishNews) * 18.0).coerceIn(-70.0, 70.0)
+            add("External news", newsScore, 0.75, "${external.bullishNews} bullish / ${external.bearishNews} bearish headlines from ${external.successfulSources} feeds")
+            add("External market breadth", external.globalMarketCapChange24hPct?.times(4.0)?.coerceIn(-50.0, 50.0), 0.45, "Global market cap 24h ${external.globalMarketCapChange24hPct?.let { "%.2f%%".format(it) } ?: "unavailable"}; BTC dominance ${external.btcDominancePct?.let { "%.1f%%".format(it) } ?: "unavailable"}")
+        }
+
+        val conflicts = mutableListOf<String>()
+        val bullish = evidence.filter { it.direction == "BULLISH" }
+        val bearish = evidence.filter { it.direction == "BEARISH" }
+        if (bullish.size >= 2 && bearish.size >= 2) conflicts += "Independent modules are split between bullish and bearish evidence."
+        val higher = listOfNotNull(mtf?.readings?.filter { it.label in setOf("1M", "1W", "3D", "1D", "12H") }?.map { it.direction }) .flatten()
+        val lower = listOfNotNull(mtf?.readings?.filter { it.label in setOf("4H", "2H", "1H", "30M", "15M", "5M") }?.map { it.direction }).flatten()
+        if (higher.count { it == "BULLISH" } >= 2 && lower.count { it == "BEARISH" } >= 2 || higher.count { it == "BEARISH" } >= 2 && lower.count { it == "BULLISH" } >= 2) conflicts += "Higher and lower timeframes are moving in opposite directions."
+        if (technicalQuality?.available == true && technicalQuality.warnings.any { it.contains("conflicts", true) }) conflicts += "Technical momentum/divergence checks conflict."
+        if (external?.newsConflict == true) conflicts += "External news sources contain material bullish/bearish conflict."
+        if (derivatives?.blockers?.isNotEmpty() == true) conflicts += "Futures positioning contains a crowding or basis risk warning."
+
+        val weighted = evidence.sumOf { it.score * it.weight }
+        val weights = evidence.sumOf { it.weight }
+        val score = if (weights > 0.0) weighted / weights else 0.0
+        val bias = direction(score)
+        val aligned = evidence.count { it.direction == bias && bias != "NEUTRAL" }
+        val agreement = if (evidence.isEmpty() || bias == "NEUTRAL") 0 else (aligned * 100 / evidence.size)
+        val confidence = ((evidence.size.coerceAtMost(10) * 6) + agreement * 0.4 - conflicts.size * 12).toInt().coerceIn(0, 95)
+        val blockers = mutableListOf<String>()
+        if (technicalQuality?.available != true) blockers += "Independent technical-quality validation is unavailable."
+        if (technicalQuality?.available == true && technicalQuality.warnings.any { it.contains("indecision", true) } && bias != "NEUTRAL") blockers += "Latest candle is indecisive; wait for a confirmed follow-through candle."
+        if (evidence.size < 5) blockers += "Unified Brain has fewer than five active evidence modules (${evidence.size}/5 minimum)."
+        if (bias == "NEUTRAL") blockers += "Unified Brain has no meaningful directional edge."
+        if (conflicts.isNotEmpty()) blockers += conflicts
+        if (learning?.allowed == false) blockers += "Adaptive learning guard has blocked this market regime."
+        if (cognitive?.risk?.allowed == false) blockers += cognitive.risk.reasons
+        val warnings = mutableListOf<String>()
+        if (walkForward == null) warnings += "Walk-Forward has not been run; no out-of-sample strategy evidence is available."
+        if (external?.verificationReady != true) warnings += "External news / market context is missing, stale or not sufficiently cross-verified; it is excluded from the directional score."
+        if (derivatives?.available != true || derivatives.blockers.isNotEmpty()) warnings += "Futures positioning is unavailable or has risk blockers; it is excluded from the directional score."
+        if (learning != null) warnings += learning.explanation
+        val coverage = "${evidence.size} active modules • ${aligned.coerceAtLeast(0)} aligned • ${conflicts.size} conflicts"
+        val status = when {
+            blockers.isNotEmpty() -> "WAIT • EVIDENCE INCOMPLETE / CONFLICTING"
+            confidence >= 75 -> "STRONG ${bias} EVIDENCE • STILL NOT A GUARANTEE"
+            else -> "${bias} BIAS • MODERATE EVIDENCE"
+        }
+        return UnifiedBrainReport(bias, score, confidence, evidence.size, coverage, status, evidence, conflicts, warnings, blockers.distinct())
+    }
+}

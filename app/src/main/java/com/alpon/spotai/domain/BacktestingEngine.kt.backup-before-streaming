@@ -1,0 +1,210 @@
+package com.alpon.spotai.domain
+
+import com.alpon.spotai.data.Candle
+import kotlin.math.max
+import kotlin.math.min
+
+data class BacktestTrade(
+    val entryTime: Long,
+    val exitTime: Long,
+    val entryPrice: Double,
+    val exitPrice: Double,
+    val quantity: Double,
+    val pnl: Double,
+    val pnlPercent: Double,
+    val result: String,
+    val exitReason: String
+)
+
+data class BacktestResult(
+    val initialCapital: Double,
+    val endingBalance: Double,
+    val netProfit: Double,
+    val totalReturnPercent: Double,
+    val totalTrades: Int,
+    val wins: Int,
+    val losses: Int,
+    val winRate: Double,
+    val profitFactor: Double?,
+    val maxDrawdownPercent: Double,
+    val totalFees: Double,
+    val signalsEvaluated: Int,
+    val trades: List<BacktestTrade>
+)
+
+object BacktestingEngine {
+
+    private data class Position(
+        val entryTime: Long,
+        val entryPrice: Double,
+        val quantity: Double,
+        val stop: Double,
+        val target: Double
+    )
+
+    fun run(
+        candles: List<Candle>,
+        interval: String = "1h",
+        initialCapital: Double = 1000.0,
+        riskPercent: Double = 1.0,
+        feeRate: Double = 0.001,
+        slippageRate: Double = 0.0005,
+        rewardRisk: Double = 2.0
+    ): BacktestResult? {
+        if (!initialCapital.isFinite() || initialCapital <= 0.0) return null
+        if (!riskPercent.isFinite() || riskPercent <= 0.0 || riskPercent > 100.0) return null
+        if (!feeRate.isFinite() || feeRate < 0.0 || feeRate > 0.01) return null
+        if (!slippageRate.isFinite() || slippageRate < 0.0 || slippageRate > 0.01) return null
+        if (!rewardRisk.isFinite() || rewardRisk < 1.0 || rewardRisk > 5.0) return null
+
+        val data = candles.sortedBy { it.time }.filter {
+            it.open.isFinite() && it.high.isFinite() &&
+            it.low.isFinite() && it.close.isFinite() &&
+            it.open > 0.0 && it.high >= it.low &&
+            it.low > 0.0 && it.close > 0.0
+        }
+
+        if (data.size < 211) return null
+
+        var balance = initialCapital
+        var peakBalance = initialCapital
+        var maxDrawdown = 0.0
+        var totalFees = 0.0
+        var grossProfit = 0.0
+        var grossLoss = 0.0
+        var signalsEvaluated = 0
+        val trades = mutableListOf<BacktestTrade>()
+        var position: Position? = null
+
+        fun closePosition(
+            pos: Position,
+            rawExit: Double,
+            exitTime: Long,
+            reason: String
+        ) {
+            val exitPrice = rawExit * (1.0 - slippageRate)
+            val fees = (pos.entryPrice + exitPrice) * pos.quantity * feeRate
+            val pnl = (exitPrice - pos.entryPrice) * pos.quantity - fees
+            val invested = pos.entryPrice * pos.quantity
+
+            balance += pnl
+            totalFees += fees
+
+            if (pnl > 0.0) grossProfit += pnl
+            if (pnl < 0.0) grossLoss += -pnl
+
+            peakBalance = max(peakBalance, balance)
+            val drawdown = if (peakBalance > 0.0) {
+                (peakBalance - balance) / peakBalance * 100.0
+            } else 0.0
+            maxDrawdown = max(maxDrawdown, drawdown)
+
+            trades += BacktestTrade(
+                pos.entryTime, exitTime,
+                pos.entryPrice, exitPrice, pos.quantity,
+                pnl,
+                if (invested > 0.0) pnl / invested * 100.0 else 0.0,
+                when {
+                    pnl > 0.0 -> "WIN"
+                    pnl < 0.0 -> "LOSS"
+                    else -> "BREAKEVEN"
+                },
+                reason
+            )
+        }
+
+        for (i in 209 until data.lastIndex) {
+            val history = data.subList(0, i + 1)
+
+            // TechnicalAnalysis excludes the newest item as a live candle.
+            // Duplicate the last closed candle so it remains in the analysis.
+            val signal = TechnicalAnalysis.analyze(history + history.last(), interval)
+                ?: continue
+
+            signalsEvaluated++
+            val next = data[i + 1]
+            val currentPosition = position
+
+            if (currentPosition != null) {
+                val exit = when {
+                    next.open <= currentPosition.stop ->
+                        next.open to "STOP_LOSS_GAP"
+                    next.open >= currentPosition.target ->
+                        next.open to "TAKE_PROFIT_GAP"
+                    signal.action == "SELL" ->
+                        next.open to "SELL_SIGNAL"
+                    next.low <= currentPosition.stop ->
+                        currentPosition.stop to "STOP_LOSS"
+                    next.high >= currentPosition.target ->
+                        currentPosition.target to "TAKE_PROFIT"
+                    else -> null
+                }
+
+                if (exit != null) {
+                    closePosition(currentPosition, exit.first, next.time, exit.second)
+                    position = null
+                }
+            } else if (signal.action == "BUY") {
+                val distance = signal.entry - signal.stop
+
+                if (distance.isFinite() && distance > 0.0) {
+                    val entryPrice = next.open * (1.0 + slippageRate)
+                    val riskCash = balance * riskPercent / 100.0
+                    val riskQuantity = riskCash / distance
+                    val capitalQuantity = balance / (entryPrice * (1.0 + feeRate))
+                    val quantity = min(riskQuantity, capitalQuantity)
+
+                    if (quantity.isFinite() && quantity > 0.0) {
+                        val newPosition = Position(
+                            next.time,
+                            entryPrice,
+                            quantity,
+                            entryPrice - distance,
+                            entryPrice + distance * rewardRisk
+                        )
+                        position = newPosition
+
+                        // Conservative intrabar rule: stop is checked before target.
+                        val exit = when {
+                            next.low <= newPosition.stop ->
+                                newPosition.stop to "STOP_LOSS"
+                            next.high >= newPosition.target ->
+                                newPosition.target to "TAKE_PROFIT"
+                            else -> null
+                        }
+
+                        if (exit != null) {
+                            closePosition(newPosition, exit.first, next.time, exit.second)
+                            position = null
+                        }
+                    }
+                }
+            }
+        }
+
+        position?.let {
+            closePosition(it, data.last().close, data.last().closeTime, "END_OF_DATA")
+        }
+
+        val wins = trades.count { it.pnl > 0.0 }
+        val losses = trades.count { it.pnl < 0.0 }
+        val netProfit = balance - initialCapital
+
+        return BacktestResult(
+            initialCapital,
+            balance,
+            netProfit,
+            netProfit / initialCapital * 100.0,
+            trades.size,
+            wins,
+            losses,
+            if (trades.isNotEmpty()) wins.toDouble() / trades.size * 100.0 else 0.0,
+            if (grossLoss > 0.0) grossProfit / grossLoss
+            else if (grossProfit > 0.0) null else 0.0,
+            maxDrawdown,
+            totalFees,
+            signalsEvaluated,
+            trades
+        )
+    }
+}

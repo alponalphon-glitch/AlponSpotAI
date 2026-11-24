@@ -1,0 +1,115 @@
+package com.alpon.spotai.domain
+
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sqrt
+
+data class RiskPlan(
+    val action: String,
+    val entry: Double,
+    val stop: Double?,
+    val tp1: Double?,
+    val tp2: Double?,
+    val tp3: Double?,
+    val rr: Double,
+    val stopDistance: Double,
+    val riskCash: Double?,
+    val quantity: Double?,
+    val notional: Double?,
+    val effectiveRisk: Double?,
+    val volatilityFactor: Double,
+    val warning: String
+)
+
+object RiskManagementEngine {
+
+    fun calculate(
+        action: String,
+        entry: Double,
+        atr: Double,
+        support: Double,
+        resistance: Double,
+        volatilityRatio: Double,
+        accountBalance: Double? = null,
+        riskPercent: Double? = null,
+        maxCapitalPercent: Double = 100.0
+    ): RiskPlan? {
+        if (!entry.isFinite() || entry <= 0.0) return null
+        if (!atr.isFinite() || atr <= 0.0) return null
+
+        if (action != "BUY" && action != "SELL") {
+            return RiskPlan(
+                action, entry, null, null, null, null,
+                0.0, 0.0, null, null, null, null,
+                1.0, "WAIT: no position should be opened."
+            )
+        }
+
+        val validRatio = volatilityRatio.takeIf {
+            it.isFinite() && it > 0.0
+        } ?: 1.0
+
+        val volatilityFactor = sqrt(validRatio).coerceIn(0.85, 1.6)
+        val atrMultiplier = 1.6 * volatilityFactor
+        val buffer = atr * 0.15
+
+        val stop = if (action == "BUY") {
+            val atrStop = entry - atr * atrMultiplier
+            if (support.isFinite() && support > 0.0 && support < entry) {
+                min(atrStop, support - buffer)
+            } else atrStop
+        } else {
+            val atrStop = entry + atr * atrMultiplier
+            if (resistance.isFinite() && resistance > entry) {
+                max(atrStop, resistance + buffer)
+            } else atrStop
+        }
+
+        val distance = abs(entry - stop)
+        if (!stop.isFinite() || distance <= 0.0) return null
+
+        val direction = if (action == "BUY") 1.0 else -1.0
+        val tp1 = entry + direction * distance
+        val tp2 = entry + direction * distance * 2.0
+        val tp3 = entry + direction * distance * 3.0
+
+        val balance = accountBalance?.takeIf {
+            it.isFinite() && it > 0.0
+        }
+        val percent = riskPercent?.takeIf {
+            it.isFinite() && it > 0.0 && it <= 100.0
+        }
+        val maxPercent = maxCapitalPercent.coerceIn(1.0, 100.0)
+
+        val riskCash = if (balance != null && percent != null) {
+            balance * percent / 100.0
+        } else null
+
+        val quantity = if (action == "BUY" && balance != null &&
+            riskCash != null
+        ) {
+            val riskBasedQty = riskCash / distance
+            val capitalLimitedQty = balance * maxPercent / 100.0 / entry
+            min(riskBasedQty, capitalLimitedQty)
+        } else null
+
+        val notional = quantity?.times(entry)
+        val effectiveRisk = quantity?.times(distance)
+
+        val warning = when {
+            validRatio >= 1.5 ->
+                "High volatility: position sizing requires extra caution."
+            quantity != null && effectiveRisk != null &&
+                riskCash != null && effectiveRisk < riskCash ->
+                "Position size capped by available capital."
+            else -> "Estimated risk only; fees, slippage and gaps are excluded."
+        }
+
+        return RiskPlan(
+            action, entry, stop, tp1, tp2, tp3,
+            3.0, distance, riskCash, quantity, notional,
+            effectiveRisk, volatilityFactor, warning
+        )
+    }
+}

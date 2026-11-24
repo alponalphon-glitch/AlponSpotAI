@@ -1,0 +1,80 @@
+package com.alpon.spotai.domain
+
+/** Central control-plane registry and final fail-closed audit of existing NEXORA modules. */
+data class MasterBrainSubsystem(
+    val name: String,
+    val status: String,
+    val detail: String,
+    val contributesToDecision: Boolean
+)
+
+data class MasterControlBrainReport(
+    val title: String,
+    val finalAction: String,
+    val gateStatus: String,
+    val connectedSubsystems: Int,
+    val totalSubsystems: Int,
+    val readinessPercent: Int,
+    val systems: List<MasterBrainSubsystem>,
+    val centralSummary: String,
+    val finalBlockers: List<String>
+)
+
+
+object MasterControlBrainEngine {
+    fun evaluate(
+        proposedAction: String,
+        allowed: Boolean,
+        integrity: DataIntegrityReport,
+        blockers: List<String>,
+        unified: UnifiedBrainReport,
+        advanced: CentralBrainAdvancedReport,
+        strategic: CentralBrainStrategicReport,
+        finalLayer: CentralBrainFinalReport,
+        autonomous: AutonomousOrchestrationReport,
+        cognitive: CognitiveExtensionReport,
+        research: NexoraResearchReport,
+        adaptive: NexoraAdaptiveReport,
+        redTeam: RedTeamReport,
+        scenarioRisk: ScenarioRiskReport,
+        shock: MarketShockReport,
+        technicalQuality: TechnicalQualityReport,
+        derivatives: FuturesDerivativesReport?,
+        external: com.alpon.spotai.data.ExternalMarketContext?,
+        walkForward: WalkForwardResult?
+    ): MasterControlBrainReport {
+        val systems = mutableListOf(
+            MasterBrainSubsystem("Market Data & Integrity", if (integrity.valid) "VERIFIED" else "BLOCKED", "${integrity.checkedCandles} closed candles; ${integrity.timeframeCount} timeframe feeds checked. ${integrity.reasons.take(2).joinToString()}", true),
+            MasterBrainSubsystem("Technical / Indicator Analysis", if (technicalQuality.available) "AVAILABLE" else "UNAVAILABLE", "${technicalQuality.direction}; score ${technicalQuality.score}", true),
+            MasterBrainSubsystem("Unified Evidence Brain", if (unified.evidenceCount >= 5) "CONNECTED" else "LIMITED", "${unified.evidenceCount} evidence sources; bias ${unified.direction}; ${unified.conflicts.size} conflict(s).", true),
+            MasterBrainSubsystem("Advanced Cognitive Layer", "CONNECTED", "Regime transition ${advanced.regimeTransition}; uncertainty ${advanced.uncertainty}; adversarial ${advanced.adversarial}; counterfactual ${advanced.counterfactual}; calibration ${advanced.calibration}; drift ${advanced.modelDrift}.", true),
+            MasterBrainSubsystem("Strategic Layer", "CONNECTED", "Liquidity ${strategic.liquidityIntelligence}; event context ${strategic.eventImpact}; execution ${strategic.executionReality}.", true),
+            MasterBrainSubsystem("Research & Quant Lab", if (research.available) "ACTIVE" else "WARM-UP", research.note, true),
+            MasterBrainSubsystem("Adaptive Learning", if (adaptive.deepLearning.acceptedAsEvidence || adaptive.reinforcementLearning.acceptedAsEvidence || adaptive.strategyEvolution.promotedToShadow) "SHADOW EVIDENCE" else "WARM-UP / SHADOW", adaptive.note, true),
+            MasterBrainSubsystem("Analyst Council", if (unified.conflicts.isEmpty()) "NO CENTRAL CONFLICT FLAG" else "CONFLICT DETECTED", "Reuses current independent rule-based analyst outputs; no separate AI agents are implied.", true),
+            MasterBrainSubsystem("Red Team / Skeptic", if (redTeam.robust) "PASSED COUNTERCHECK" else "COUNTER-EVIDENCE", redTeam.counterArguments.take(3).joinToString().ifBlank { "No counterarguments supplied." }, true),
+            MasterBrainSubsystem("Scenario & Stress Risk", if (scenarioRisk.sufficientHistory) "STRESS EVIDENCE" else "INSUFFICIENT HISTORY", "Stop covers historical stress ${scenarioRisk.stopCoversHistoricalStress}; historical stress sufficiency ${scenarioRisk.sufficientHistory}.", true),
+            MasterBrainSubsystem("Market Shock Circuit Breaker", if (shock.safeForNewEntry) "CLEAR" else "GUARD ACTIVE", shock.findings.take(3).joinToString().ifBlank { "No shock guard finding." }, true),
+            MasterBrainSubsystem("Derivatives Context", if (derivatives?.available == true && derivatives.blockers.isEmpty()) "AVAILABLE" else "UNAVAILABLE / GUARDED", derivatives?.directionalBias ?: "No derivatives report provided.", false),
+            MasterBrainSubsystem("External Market / News Context", if (external?.verificationReady == true) "VERIFIED" else "UNVERIFIED / MISSING", "External context is only admitted when source verification passes.", false),
+            MasterBrainSubsystem("Walk-Forward Validation", if (walkForward != null) "RESULT PRESENT" else "NOT RUN", LearningValidationEngine.assess(walkForward).status, true),
+            MasterBrainSubsystem("Decision Trace / Snapshot Monitor", "CONNECTED", finalLayer.decisionTrace + " • " + finalLayer.liveMonitor, true),
+            MasterBrainSubsystem("Autonomous Orchestration", "CONNECTED / PAPER-FIRST", "${autonomous.readyModules}/${autonomous.totalModules} ready in orchestration; paper-first only.", true),
+            MasterBrainSubsystem("Portfolio Intelligence", "NOT CONNECTED", "No portfolio-wide position/correlation exposure object is supplied to this decision pipeline.", false),
+            MasterBrainSubsystem("Execution Reality", "PARTIAL PROXY", strategic.executionDetail, false)
+        )
+        cognitive.modules.forEach { module ->
+            systems += MasterBrainSubsystem("Cognitive: ${module.name}", module.state, module.detail, module.safetyCritical)
+        }
+        val unavailableMarkers = listOf("UNAVAILABLE", "NOT CONNECTED", "NOT RUN", "UNVERIFIED", "WARM-UP", "LIMITED", "INSUFFICIENT", "GUARD", "PARTIAL", "NOT PROMOTED", "REJECTED")
+        val connected = systems.count { system -> unavailableMarkers.none { marker -> system.status.contains(marker, true) } }
+        val readiness = (connected * 100 / systems.size).coerceIn(0, 100)
+        val failClosed = blockers.distinct().toMutableList()
+        if (!integrity.valid && failClosed.none { it.contains("integrity", true) }) failClosed += "Master Brain: data integrity failed."
+        // This control layer can downgrade a proposal to WAIT; it never upgrades a blocked decision.
+        val finalAction = if (integrity.valid && allowed && proposedAction == "BUY" && failClosed.isEmpty()) "BUY" else if (integrity.valid && proposedAction == "SELL" && failClosed.isEmpty()) "SELL" else "WAIT"
+        val gate = if (finalAction == proposedAction && finalAction in setOf("BUY", "SELL")) "FINAL GATE PASSED" else "FINAL GATE: WAIT / BLOCKED"
+        val summary = "Central controller reviewed ${systems.size} subsystem records: $connected with evidence/status; $finalAction is the final fail-closed action. Readiness is a module-status count, not model accuracy."
+        return MasterControlBrainReport("NEXORA MASTER CONTROL BRAIN", finalAction, gate, connected, systems.size, readiness, systems, summary, failClosed)
+    }
+}

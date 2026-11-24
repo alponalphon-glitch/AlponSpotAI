@@ -1,0 +1,403 @@
+package com.alpon.spotai.domain
+
+import com.alpon.spotai.data.Candle
+import com.alpon.spotai.data.TickerDto
+import kotlin.math.abs
+
+/** Fail-closed validation of raw Binance candles and multi-timeframe coverage. */
+data class DataIntegrityReport(
+    val valid: Boolean,
+    val checkedCandles: Int,
+    val timeframeCount: Int,
+    val reasons: List<String>
+)
+
+object DataIntegrityEngine {
+    private fun forexMarketClosedForWeekend(now:Long):Boolean {
+        val utc=java.time.Instant.ofEpochMilli(now).atZone(java.time.ZoneOffset.UTC)
+        return utc.dayOfWeek==java.time.DayOfWeek.SATURDAY ||
+            (utc.dayOfWeek==java.time.DayOfWeek.SUNDAY && utc.hour<22)
+    }
+
+    private fun intervalMillis(interval: String): Long? {
+        val value = interval.dropLast(1).toLongOrNull() ?: return null
+        val unit = interval.lastOrNull() ?: return null
+        return when {
+            unit == 'M' && value == 1L -> value * 30L * 86_400_000L
+            unit.lowercaseChar() == 'm' -> value * 60_000L
+            unit.lowercaseChar() == 'h' -> value * 3_600_000L
+            unit.lowercaseChar() == 'd' -> value * 86_400_000L
+            unit.lowercaseChar() == 'w' -> value * 7L * 86_400_000L
+            else -> null
+        }
+    }
+
+    fun validate(
+        candles: List<Candle>,
+        selectedInterval: String,
+        multiTimeframe: MultiTimeframeSignal?,
+        now: Long = System.currentTimeMillis(),
+        ticker: TickerDto? = null,
+        expectedSymbol: String? = null
+    ): DataIntegrityReport {
+        val reasons = mutableListOf<String>()
+        val isForexMarket = expectedSymbol?.startsWith("FX_") == true
+        val duration = intervalMillis(selectedInterval)
+        if (duration == null) reasons += "Unsupported selected ${if(isForexMarket) "Forex" else "Binance"} interval."
+        // Binance REST commonly includes one still-forming kline. Exclude it; never analyze it as a closed candle.
+        if (candles.any { it.closeTime <= 0L }) reasons += "One or more market candles have a missing/invalid close timestamp."
+        val closedCandles = candles.filter { it.closeTime > 0L && it.closeTime <= now }
+        if (closedCandles.size < 220) reasons += "Selected timeframe has fewer than 220 confirmed closed candles; EMA-200 and context are not sufficiently warmed up."
+        val ordered = closedCandles.sortedBy { it.time }
+        if (ordered != closedCandles) reasons += "Market candles are not in strict chronological order."
+        if (closedCandles.zipWithNext().any { it.first.time >= it.second.time }) reasons += "Duplicate or non-increasing candle timestamps detected."
+        if (closedCandles.any {
+                !it.time.let { t -> t > 0L } || !it.open.isFinite() || !it.high.isFinite() ||
+                    !it.low.isFinite() || !it.close.isFinite() || !it.volume.isFinite() ||
+                    it.open <= 0.0 || it.close <= 0.0 || it.low <= 0.0 || it.high < it.low ||
+                    it.high < maxOf(it.open, it.close) || it.low > minOf(it.open, it.close) || it.volume < 0.0 ||
+                    !it.quoteVolume.isFinite() || it.quoteVolume < 0.0 || it.tradeCount < 0L ||
+                    !it.takerBuyBaseVolume.isFinite() || it.takerBuyBaseVolume < 0.0 || it.takerBuyBaseVolume > it.volume + 1e-9 ||
+                    !it.takerBuyQuoteVolume.isFinite() || it.takerBuyQuoteVolume < 0.0 || it.takerBuyQuoteVolume > it.quoteVolume + 1e-6
+            }) reasons += "Invalid OHLCV values found in market candles."
+        val last = closedCandles.lastOrNull()
+        if (last == null) reasons += "No confirmed closed market candles received."
+        else {
+            val staleAllowance = if (isForexMarket && selectedInterval == "1d") 4.0 else 2.5
+            val forexWeekendGrace=isForexMarket && forexMarketClosedForWeekend(now) && last.closeTime >= now-72L*3_600_000L
+            if (duration != null && now - last.closeTime > duration * staleAllowance && !forexWeekendGrace) {
+                reasons += "Latest market candle is stale for the selected timeframe."
+            }
+        }
+        if (duration != null && closedCandles.size >= 3) {
+            val recent = closedCandles.takeLast(100)
+            val fxDailyGapAllowance = isForexMarket && selectedInterval == "1d"
+            val weekendGaps = isForexMarket
+            if (recent.zipWithNext().any { (a, b) ->
+                    val gap=b.time-a.time
+                    val normalLimit=duration * (if(fxDailyGapAllowance) 4.0 else 1.5)
+                    val expectedForexWeekend=weekendGaps && gap in 36L*3_600_000L..72L*3_600_000L
+                    gap > normalLimit && !expectedForexWeekend && !selectedInterval.endsWith("M")
+                }) {
+                reasons += "A data gap was detected in the latest 100 market candles."
+            }
+        }
+
+        if (ticker == null) reasons += "${if(isForexMarket) "Forex" else "Binance 24-hour"} ticker is missing."
+        else {
+            if (expectedSymbol != null && ticker.symbol != expectedSymbol) reasons += "Market ticker symbol does not match the selected instrument."
+            val lastPrice = ticker.lastPrice.toDoubleOrNull()
+            val baseVolume = ticker.volume.toDoubleOrNull()
+            val quoteVolume = ticker.quoteVolume.toDoubleOrNull()
+            val change = ticker.priceChangePercent.toDoubleOrNull()
+            if (lastPrice == null || !lastPrice.isFinite() || lastPrice <= 0.0 ||
+                baseVolume == null || !baseVolume.isFinite() || baseVolume < 0.0 ||
+                quoteVolume == null || !quoteVolume.isFinite() || quoteVolume < 0.0 ||
+                change == null || !change.isFinite()) reasons += "Market ticker contains incomplete or invalid fields."
+        }
+
+        val frames = multiTimeframe?.readings.orEmpty()
+        val isForex = expectedSymbol?.startsWith("FX_") == true
+        val mandatory = if (isForex) setOf("1M", "1W", "1D", "4H", "2H", "1H", "15M")
+            else setOf("1M", "1W", "3D", "1D", "12H", "8H", "4H", "2H", "1H", "30M", "15M", "5M")
+        if (multiTimeframe == null) reasons += "Multi-timeframe market analysis is missing."
+        if (frames.size != mandatory.size) reasons += "All ${mandatory.size} required ${if (isForex) "Forex" else "Binance"} timeframes are required; only ${frames.size}/${mandatory.size} are valid."
+        val present = frames.map { it.label }.toSet()
+        (mandatory - present).forEach { reasons += "Required ${if(isForex) "Forex" else "Binance"} timeframe $it is missing." }
+        frames.forEach { frame ->
+            val frameDuration = intervalMillis(frame.label)
+            if (frame.candles < 25 && frame.label != "1M") reasons += "${frame.label} has insufficient closed candles."
+            if (frame.lastCloseTime <= 0L || frame.lastCloseTime > now) reasons += "${frame.label} has no confirmed closed-candle timestamp."
+            else {
+                val allowance = if(isForex && frame.label=="1D") 4.0 else if(isForex && frame.label=="1W") 1.5 else 2.5
+                val forexWeekendGrace=isForex && forexMarketClosedForWeekend(now) && frame.lastCloseTime >= now-72L*3_600_000L
+                if(frameDuration != null && now - frame.lastCloseTime > frameDuration * allowance && !forexWeekendGrace) reasons += "${frame.label} market data is stale."
+            }
+        }
+        return DataIntegrityReport(reasons.isEmpty(), closedCandles.size, frames.size, reasons.distinct())
+    }
+}
+
+data class AnalystOpinion(
+    val analyst: String,
+    val direction: String,
+    val score: Int,
+    val rationale: String
+)
+
+data class DecisionIntelligenceReport(
+    val action: String,
+    val allowed: Boolean,
+    val integrity: DataIntegrityReport,
+    val analysts: List<AnalystOpinion>,
+    val consensusPercent: Int,
+    val walkForwardStatus: String,
+    val estimatedNetRewardRisk: Double?,
+    val redTeam: RedTeamReport,
+    val scenarioRisk: ScenarioRiskReport,
+    val blockers: List<String>,
+    val riskNote: String,
+    val unifiedBrain: UnifiedBrainReport,
+    val marketShock: MarketShockReport,
+    val advancedBrains: AdvancedBrainsReport,
+    val technicalQuality: TechnicalQualityReport,
+    val researchIntelligence: NexoraResearchReport,
+    val adaptiveIntelligence: NexoraAdaptiveReport,
+    val autonomous: AutonomousOrchestrationReport,
+    val cognitiveExtensions: CognitiveExtensionReport
+)
+
+/** Independent rule-based analyst perspectives. These are not separate LLMs or trained neural nets. */
+object IndependentAnalystEngine {
+    fun analyze(
+        technical: Signal?,
+        mtf: MultiTimeframeSignal?,
+        structure: MarketStructureReport?,
+        regime: MarketRegimeReport?,
+        priceAction: PriceActionReport?,
+        smartMoney: SmartMoneyReport?
+    ): List<AnalystOpinion> = buildList {
+        technical?.let {
+            add(AnalystOpinion("MOMENTUM ANALYST", direction(it.action), it.score.coerceIn(-100, 100),
+                "RSI ${"%.1f".format(it.rsi)}; EMA 9/21/50/200 and indicator votes ${it.bullishVotes}/${it.bearishVotes}."))
+        }
+        mtf?.let {
+            val score = (it.score - 50) * 2
+            add(AnalystOpinion("MULTI-TIMEFRAME ANALYST", direction(it.action), score.coerceIn(-100, 100),
+                "${it.alignment}; ${it.trend}."))
+        }
+        structure?.let {
+            val bullish = it.events.count { e -> e.direction == "BULLISH" }
+            val bearish = it.events.count { e -> e.direction == "BEARISH" }
+            val score = ((bullish - bearish) * 25).coerceIn(-100, 100)
+            val trendDirection = when { it.trend.contains("UP", true) || it.trend.contains("BULL", true) -> "BULLISH"; it.trend.contains("DOWN", true) || it.trend.contains("BEAR", true) -> "BEARISH"; else -> directionFromScore(score) }
+            add(AnalystOpinion("MARKET STRUCTURE ANALYST", if (trendDirection == "NEUTRAL") directionFromScore(score) else trendDirection,
+                if (score == 0) 15 else score, "${it.trend}; ${it.events.size} structure events; liquidity sweep ${it.liquiditySweep}."))
+        }
+        regime?.let {
+            val score = when {
+                it.trend.contains("BULL", true) -> 55
+                it.trend.contains("BEAR", true) -> -55
+                else -> 0
+            }
+            add(AnalystOpinion("REGIME ANALYST", directionFromScore(score), score,
+                "${it.regime}; ${it.trend}; volatility ${it.volatility}."))
+        }
+        priceAction?.let {
+            val horizon = it.twoYearTrend ?: it.yearlyTrend ?: it.weeklyTrend
+            if (horizon != null) add(AnalystOpinion("LONG-HORIZON ANALYST", horizon.direction,
+                horizon.score.toInt().coerceIn(-100, 100), "${horizon.label}: ${horizon.structure}; ${it.summary}"))
+        }
+        smartMoney?.let {
+            add(AnalystOpinion("LIQUIDITY & BREAKOUT ANALYST", directionFromScore(it.score.toInt()),
+                it.score.toInt().coerceIn(-100, 100), "${it.breakoutQuality}; ${it.explanation}"))
+        }
+    }
+
+    private fun direction(action: String): String = when (action.uppercase()) {
+        "BUY", "BULLISH" -> "BULLISH"
+        "SELL", "BEARISH" -> "BEARISH"
+        else -> "NEUTRAL"
+    }
+    private fun directionFromScore(score: Int) = when { score >= 20 -> "BULLISH"; score <= -20 -> "BEARISH"; else -> "NEUTRAL" }
+}
+
+data class StrategyValidationReport(val reliable: Boolean, val status: String)
+
+/** Walk-forward acceptance policy. A weak or undersampled out-of-sample result is never promoted. */
+object LearningValidationEngine {
+    fun assess(result: WalkForwardResult?): StrategyValidationReport {
+        if (result == null) return StrategyValidationReport(false, "NOT VALIDATED — run Walk-Forward before trusting a strategy")
+        val status = when {
+            result.totalTestFolds < 2 || result.outOfSampleTrades < 10 -> "WEAK SAMPLE — need at least 2 unseen folds and 10 out-of-sample trades"
+            result.folds.any { !it.trainingReliable } -> "UNRELIABLE — training windows lack enough trades"
+            !result.compoundedOutOfSampleReturnPercent.isFinite() || result.compoundedOutOfSampleReturnPercent <= 0.0 -> "REJECTED — out-of-sample return is not finite and positive"
+            result.profitableTestFolds * 2 < result.totalTestFolds -> "REJECTED — most unseen test windows were not profitable"
+            !result.averageOutOfSampleDrawdownPercent.isFinite() || result.averageOutOfSampleDrawdownPercent < 0.0 || result.averageOutOfSampleDrawdownPercent > 10.0 -> "REJECTED — out-of-sample drawdown is invalid or exceeds 10%"
+            result.folds.any { fold -> fold.testReturnPercent.isFinite().not() || fold.testDrawdownPercent.isFinite().not() || fold.testProfitFactor?.let { !it.isFinite() || it <= 1.0 } == true } -> "REJECTED — test metrics are invalid or a test fold has profit factor at or below 1.0"
+            else -> "PASSED — historical out-of-sample evidence only; not a future guarantee"
+        }
+        return StrategyValidationReport(status.startsWith("PASSED"), status)
+    }
+}
+
+/** Final fail-closed decision layer: validates data, analyst agreement, costs, structure and walk-forward evidence. */
+object DecisionIntelligenceEngine {
+    fun evaluate(
+        candles: List<Candle>,
+        interval: String,
+        technical: Signal?,
+        mtf: MultiTimeframeSignal?,
+        structure: MarketStructureReport?,
+        regime: MarketRegimeReport?,
+        priceAction: PriceActionReport?,
+        smartMoney: SmartMoneyReport?,
+        ai: AIAnalysisReport?,
+        walkForward: WalkForwardResult?,
+        ticker: TickerDto?,
+        symbol: String,
+        hasSpotHolding: Boolean,
+        lossGuardAllowed: Boolean,
+        lossGuardReason: String,
+        externalContext: com.alpon.spotai.data.ExternalMarketContext? = null,
+        cognitive: CognitiveIntelligenceReport? = null,
+        derivatives: FuturesDerivativesReport? = null,
+        ensemble: TechnicalEnsembleReport? = null,
+        learning: AdaptiveLearningDecision? = null,
+        benchmarkCandles: List<Candle> = emptyList(),
+        benchmarkSymbol: String = "BTCUSDT",
+        paperOutcomes: List<AdaptiveTradeOutcome> = emptyList()
+    ): DecisionIntelligenceReport {
+        val integrity = DataIntegrityEngine.validate(candles, interval, mtf, ticker = ticker, expectedSymbol = symbol)
+        val analysts = IndependentAnalystEngine.analyze(technical, mtf, structure, regime, priceAction, smartMoney)
+        val redTeam = RedTeamValidationEngine.evaluate(candles, technical, ai)
+        val scenarioRisk = ScenarioRiskEngine.evaluate(candles, technical)
+        val marketShock = MarketShockCircuitBreaker.evaluate(candles)
+        val advancedBrains = AdvancedMarketBrains.evaluate(candles, benchmarkCandles, benchmarkSymbol, paperOutcomes, walkForward, ticker?.lastPrice?.toDoubleOrNull() ?: 0.0)
+        val technicalQuality = TechnicalQualityEngine.analyze(candles)
+        val researchIntelligence = NexoraResearchIntelligence.evaluate(candles, advancedBrains.correlation, advancedBrains.liquidity, advancedBrains.execution, advancedBrains.strategyDoctor, advancedBrains.marketMemory, walkForward, externalContext, marketShock, redTeam, scenarioRisk)
+        val adaptiveIntelligence = NexoraAdaptiveIntelligence.evaluate(candles)
+        val unifiedBrain = AlponUnifiedBrainEngine.synthesize(
+            technical, mtf, structure, regime, priceAction, smartMoney, ensemble,
+            cognitive, derivatives, externalContext, learning, walkForward, technicalQuality, researchIntelligence, adaptiveIntelligence
+        )
+        val autonomous = AutonomousEngineOrchestrator.evaluate(
+            integrity = integrity,
+            analysts = analysts,
+            redTeam = redTeam,
+            scenarioRisk = scenarioRisk,
+            marketShock = marketShock,
+            research = researchIntelligence,
+            adaptive = adaptiveIntelligence,
+            unifiedBrain = unifiedBrain,
+            external = externalContext,
+            paperMemoryCount = paperOutcomes.size,
+            walkForward = walkForward
+        )
+        val blockers = mutableListOf<String>()
+        blockers += integrity.reasons
+        if (ai?.action == "BUY") blockers += autonomous.blockers
+        if (ai?.action in setOf("BUY", "SELL") && !technicalQuality.available) blockers += "Independent technical-quality engine is unavailable; WAIT."
+        if (ai?.action == "BUY" && technicalQuality.available && technicalQuality.direction == "BEARISH") blockers += "Independent technical-quality checks oppose BUY; WAIT."
+        if (ai?.action == "SELL" && technicalQuality.available && technicalQuality.direction == "BULLISH") blockers += "Independent technical-quality checks oppose SELL; WAIT."
+        if (ai?.action in setOf("BUY", "SELL") && technicalQuality.warnings.any { it.contains("indecision", true) }) blockers += "Latest candle is indecisive; wait for follow-through."
+        if (ai?.action in setOf("BUY", "SELL") && abs(researchIntelligence.lastReturnZScore ?: 0.0) >= 4.0) blockers += "Quant research detected an extreme return anomaly (Z-score ≥ 4); wait for volatility normalization."
+        if (ai?.action in setOf("BUY", "SELL") && (researchIntelligence.volatilityClusterRatio ?: 0.0) >= 4.0) blockers += "Quant research detected an extreme volatility-clustering regime; new entries are paused."
+        if (ai?.action == "BUY") {
+            if (!marketShock.safeForNewEntry) blockers += marketShock.findings.ifEmpty { listOf("Market shock circuit breaker requires more confirmed data; WAIT.") }
+            if (unifiedBrain.direction != "BULLISH") blockers += "Unified Brain does not confirm a bullish edge (${unifiedBrain.direction}, score ${"%.1f".format(unifiedBrain.directionalScore)})."
+            if (unifiedBrain.evidenceCount < 5) blockers += unifiedBrain.blockers
+            if (unifiedBrain.conflicts.isNotEmpty()) blockers += unifiedBrain.conflicts
+        }
+        if (derivatives?.available == true && derivatives.blockers.isNotEmpty()) blockers += derivatives.blockers
+        if (ai?.action == "BUY" && !advancedBrains.execution.available) blockers += "Execution quality evidence is unavailable; WAIT."
+        if (ai?.action == "BUY" && advancedBrains.execution.grade == "PROXY LIMITED") blockers += "Execution quality is only a limited candle-based proxy; exact spread/depth is not verified."
+        if (ai == null) blockers += "AI analysis report is unavailable."
+        if (technical == null) blockers += "Technical analysis is unavailable."
+        if (mtf == null) blockers += "Multi-timeframe confirmation is unavailable."
+        val bullish = analysts.count { it.direction == "BULLISH" && abs(it.score) >= 20 }
+        val bearish = analysts.count { it.direction == "BEARISH" && abs(it.score) >= 20 }
+        val active = bullish + bearish
+        val consensus = if (active == 0) 0 else (maxOf(bullish, bearish) * 100 / active)
+        if (active < 3) blockers += "Fewer than three independent analyst opinions have meaningful evidence."
+        if (ai?.action == "BUY" && analysts.size < 5) blockers += "Deep analysis is incomplete; at least five independent analyst modules must be available."
+        if (consensus < 67) blockers += "Independent analysts disagree; WAIT instead of forcing a trade."
+
+        // Independent external verification is mandatory before approving a directional crypto signal.
+        if (ai?.action in setOf("BUY", "SELL") && !symbol.startsWith("FX_")) {
+            val context = externalContext
+            if (context == null) blockers += "External news and market verification is unavailable; WAIT."
+            else {
+                if (!context.verificationReady) blockers += "External verification incomplete: require fresh CoinGecko coin/global metrics, CoinMarketCap feed access, at least 3 relevant headlines and 2 independent coin-news publishers."
+                if (context.newsConflict) blockers += "External headlines show material bullish/bearish conflict; WAIT for clarification."
+                if (context.coinGeckoChange24hPct != null && context.coinGeckoChange24hPct <= -15.0 && ai?.action == "BUY") blockers += "CoinGecko reports an extreme 24-hour drawdown; BUY requires a fresh reassessment."
+                if (context.coinGeckoChange24hPct != null && context.coinGeckoChange24hPct >= 20.0 && ai?.action == "SELL") blockers += "CoinGecko reports an extreme 24-hour rally; SELL requires a fresh reassessment."
+            }
+        }
+
+        val isForex = symbol.startsWith("FX_")
+        val higher = mtf?.readings.orEmpty().filter { it.label in if (isForex) setOf("1M", "1W", "1D") else setOf("1M", "1W", "3D", "1D", "12H") }
+        val lower = mtf?.readings.orEmpty().filter { it.label in if (isForex) setOf("4H", "2H", "1H", "15M") else setOf("4H", "2H", "1H", "30M", "15M", "5M") }
+        val higherBull = higher.count { it.direction == "BULLISH" }
+        val higherBear = higher.count { it.direction == "BEARISH" }
+        val lowerBull = lower.count { it.direction == "BULLISH" }
+        val lowerBear = lower.count { it.direction == "BEARISH" }
+        val timeframeConflict = (higherBull >= 2 && lowerBear >= 2) || (higherBear >= 2 && lowerBull >= 2)
+        if (timeframeConflict) blockers += "Higher and lower timeframes conflict; risk must not be increased and new BUY is blocked."
+
+        val falseBreakout = smartMoney?.breakoutQuality?.contains("FALSE_BREAKOUT", true) == true
+        if (falseBreakout) blockers += "False breakout detected; BUY rejected until a confirmed close and retest."
+        if (regime?.volatility == "HIGH") blockers += "High volatility regime; new entry blocked."
+        if (ai?.action == "BUY") {
+            if (!lossGuardAllowed) blockers += "Capital loss guard blocked new entries: $lossGuardReason"
+            if (structure == null) blockers += "Market structure analysis is unavailable."
+            if (regime == null) blockers += "Market regime analysis is unavailable."
+            if (smartMoney == null) blockers += "Smart Money / liquidity analysis is unavailable."
+            val twoYearBars = priceAction?.twoYearTrend?.candles ?: 0
+            if (twoYearBars < 600) blockers += "Long-horizon history is incomplete: at least 600 daily candles are required for a robust 1–2 year context."
+        }
+
+        val validation = LearningValidationEngine.assess(walkForward)
+        val wfStatus = validation.status
+        val wfPassed = validation.reliable
+        if (ai?.action == "BUY" && !wfPassed) blockers += "Walk-Forward validation has not established a sufficiently robust strategy: $wfStatus."
+
+        val gate = ai?.qualityGate
+        if (ai == null || ai.action == "WAIT") blockers += "AI consensus is WAIT; there is no verified directional entry."
+        if (ai?.action == "SELL" && !hasSpotHolding && !isForex) blockers += "Bearish conditions detected but no Spot holding exists; WAIT. Short selling is disabled."
+        if (isForex && ai?.action in setOf("BUY", "SELL")) blockers += "Forex broker bid/ask spread and execution costs are not connected. Directional analysis is not an approved order; WAIT until broker costs are verified."
+        if (ai?.action == "BUY" && gate?.allowed != true) {
+            if (gate != null) blockers.addAll(gate.blockers.ifEmpty { listOf("Capital Protection / Trade Quality Gate did not approve entry.") })
+            else blockers += "Trade Quality Gate is unavailable."
+        }
+        if (ai?.action == "BUY" && !redTeam.robust) blockers.addAll(redTeam.counterArguments)
+        if (ai?.action == "BUY" && !scenarioRisk.sufficientHistory) {
+            blockers += "Historical downside stress test is incomplete; BUY is blocked until risk can be measured."
+        }
+        if (ai?.action == "BUY" && !scenarioRisk.stopCoversHistoricalStress) {
+            blockers += "Proposed Stop Loss does not cover the historical downside stress reference; widen/recalculate the plan or WAIT."
+        }
+        val netRr = gate?.estimatedNetRewardRisk
+        if (ai?.action == "BUY" && (netRr == null || !netRr.isFinite() || netRr < 1.5)) blockers += "Net reward/risk after estimated fees and slippage is below 1.5:1 or cannot be verified."
+        val entry = technical?.entry ?: Double.NaN
+        val stop = technical?.stop ?: Double.NaN
+        val target = technical?.tp2 ?: Double.NaN
+        if (ai?.action == "BUY" && (!entry.isFinite() || !stop.isFinite() || !target.isFinite() || entry <= 0.0 || stop <= 0.0 || target <= 0.0 || stop >= entry || target <= entry)) {
+            blockers += "BUY entry, Stop Loss or Take Profit is invalid; trade must not open."
+        }
+        val cognitiveExtensions = AdvancedCognitiveEngines.evaluate(
+            candles = candles,
+            regime = regime,
+            research = researchIntelligence,
+            scenario = scenarioRisk,
+            redTeam = redTeam,
+            shock = marketShock,
+            walkForward = walkForward,
+            paperOutcomes = paperOutcomes,
+            adaptive = adaptiveIntelligence,
+            integrity = integrity,
+            existingBlockers = blockers.distinct()
+        )
+        if (ai?.action in setOf("BUY", "SELL")) blockers += cognitiveExtensions.blockers
+        val combinedAutonomous = autonomous.copy(
+            modules = autonomous.modules + cognitiveExtensions.modules.map {
+                AutonomousModuleStatus(it.name, it.state, it.detail, it.safetyCritical)
+            },
+            readyModules = autonomous.readyModules + cognitiveExtensions.modules.count {
+                it.state in setOf("ASSOCIATION MEASURED", "EMPIRICAL BASELINE", "REGIME CLASSIFIED", "AVAILABLE CHECKS PASSED", "PAPER OUTCOMES CONNECTED", "NO CURRENT DRIFT FLAG", "NO NEW META BLOCKER")
+            },
+            totalModules = autonomous.totalModules + cognitiveExtensions.modules.size,
+            blockers = (autonomous.blockers + cognitiveExtensions.blockers).distinct(),
+            summary = "${autonomous.readyModules + cognitiveExtensions.modules.count { it.state in setOf("ASSOCIATION MEASURED", "EMPIRICAL BASELINE", "REGIME CLASSIFIED", "AVAILABLE CHECKS PASSED", "PAPER OUTCOMES CONNECTED", "NO CURRENT DRIFT FLAG", "NO NEW META BLOCKER") }}/${autonomous.totalModules + cognitiveExtensions.modules.size} modules have usable evidence; execution remains subject to existing trade gates."
+        )
+        val allowed = blockers.isEmpty() && ai?.action == "BUY"
+        val action = when {
+            !integrity.valid -> "WAIT"
+            ai?.action == "SELL" && hasSpotHolding && blockers.isEmpty() -> "SELL"
+            allowed -> "BUY"
+            else -> "WAIT"
+        }
+        val riskNote = if (timeframeConflict) "Timeframe conflict never increases risk. Wait for alignment." else "Risk is never increased by disagreement or positive paper results."
+        return DecisionIntelligenceReport(action, allowed, integrity, analysts, consensus, wfStatus, netRr, redTeam, scenarioRisk, blockers.distinct(), riskNote, unifiedBrain, marketShock, advancedBrains, technicalQuality, researchIntelligence, adaptiveIntelligence, combinedAutonomous, cognitiveExtensions)
+    }
+}

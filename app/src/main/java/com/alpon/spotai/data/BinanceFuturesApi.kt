@@ -1,0 +1,127 @@
+package com.alpon.spotai.data
+
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonConverterFactory
+import retrofit2.http.GET
+import retrofit2.http.Query
+
+interface BinanceFuturesApi {
+    @GET("fapi/v1/exchangeInfo") suspend fun usdExchangeInfo(): FuturesExchangeInfo
+    @GET("dapi/v1/exchangeInfo") suspend fun coinExchangeInfo(): FuturesExchangeInfo
+    @GET("fapi/v1/ticker/24hr") suspend fun usdTickers(): List<FuturesTickerDto>
+    @GET("dapi/v1/ticker/24hr") suspend fun coinTickers(): List<FuturesTickerDto>
+    @GET("fapi/v1/klines") suspend fun usdKlines(@Query("symbol") symbol:String,@Query("interval") interval:String,@Query("limit") limit:Int=1000,@Query("startTime") startTime:Long?=null,@Query("endTime") endTime:Long?=null):List<List<Any>>
+    @GET("dapi/v1/klines") suspend fun coinKlines(@Query("symbol") symbol:String,@Query("interval") interval:String,@Query("limit") limit:Int=1000,@Query("startTime") startTime:Long?=null,@Query("endTime") endTime:Long?=null):List<List<Any>>
+    @GET("fapi/v1/premiumIndex") suspend fun usdPremium(@Query("symbol") symbol:String):FuturesPremiumDto
+    @GET("dapi/v1/premiumIndex") suspend fun coinPremium(@Query("symbol") symbol:String):FuturesPremiumDto
+    @GET("fapi/v1/openInterest") suspend fun usdOpenInterest(@Query("symbol") symbol:String):FuturesOpenInterestDto
+    @GET("dapi/v1/openInterest") suspend fun coinOpenInterest(@Query("symbol") symbol:String):FuturesOpenInterestDto
+    @GET("futures/data/openInterestHist") suspend fun usdOpenInterestHistory(@Query("symbol") symbol:String,@Query("period") period:String="5m",@Query("limit") limit:Int=30):List<FuturesOpenInterestPoint>
+    @GET("futures/data/openInterestHist") suspend fun coinOpenInterestHistory(@Query("pair") pair:String,@Query("period") period:String="5m",@Query("limit") limit:Int=30,@Query("contractType") contractType:String?=null):List<FuturesOpenInterestPoint>
+    @GET("futures/data/globalLongShortAccountRatio") suspend fun usdLongShortRatio(@Query("symbol") symbol:String,@Query("period") period:String="5m",@Query("limit") limit:Int=30):List<FuturesLongShortPoint>
+    @GET("futures/data/globalLongShortAccountRatio") suspend fun coinLongShortRatio(@Query("pair") pair:String,@Query("period") period:String="5m",@Query("limit") limit:Int=30,@Query("contractType") contractType:String?=null):List<FuturesLongShortPoint>
+    @GET("futures/data/takerBuySellVol") suspend fun coinTakerBuySellVolume(@Query("pair") pair:String,@Query("contractType") contractType:String,@Query("period") period:String="5m",@Query("limit") limit:Int=30):List<FuturesTakerVolumePoint>
+    @GET("futures/data/takerlongshortRatio") suspend fun usdTakerRatio(@Query("symbol") symbol:String,@Query("period") period:String="5m",@Query("limit") limit:Int=30):List<FuturesTakerPoint>
+    companion object {
+        fun create(base:String):BinanceFuturesApi = Retrofit.Builder().baseUrl(base).addConverterFactory(GsonConverterFactory.create()).build().create(BinanceFuturesApi::class.java)
+    }
+}
+
+data class FuturesExchangeInfo(val symbols:List<FuturesContractDto> = emptyList())
+data class FuturesPremiumDto(val symbol:String="",val markPrice:String="",val indexPrice:String="",val lastFundingRate:String="",val nextFundingTime:Long=0L)
+data class FuturesOpenInterestDto(val symbol:String="",val openInterest:String="")
+data class FuturesOpenInterestPoint(val sumOpenInterest:String="",val sumOpenInterestValue:String="",val timestamp:Long=0L)
+data class FuturesLongShortPoint(val longShortRatio:String="",val longAccount:String="",val shortAccount:String="",val timestamp:Long=0L)
+data class FuturesTakerPoint(val buySellRatio:String="",val buyVol:String="",val sellVol:String="",val timestamp:Long=0L)
+data class FuturesTakerVolumePoint(val takerBuyVol:String="",val takerSellVol:String="",val timestamp:Long=0L)
+data class FuturesContractDto(val symbol:String,val pair:String?=null,val status:String?=null,val contractType:String?=null,val quoteAsset:String?=null,val marginAsset:String?=null,val baseAsset:String?=null)
+data class FuturesTickerDto(val symbol:String,val lastPrice:String,val priceChangePercent:String="0",val volume:String="0",val quoteVolume:String="0")
+
+data class FuturesMarket(val symbol:String,val pair:String,val contractType:String,val marginAsset:String,val lastPrice:String,val priceChangePercent:String,val quoteVolume:String)
+data class FuturesDerivativesSnapshot(
+    val symbol:String,val markPrice:Double,val indexPrice:Double,val fundingRate:Double,val nextFundingTime:Long,
+    val openInterest:Double,val openInterestChangePercent:Double,val longShortRatio:Double,
+    val takerBuySellRatio:Double,val observedAt:Long
+)
+
+private data class FuturesOpenInterestHistoryResult(val rows:List<FuturesOpenInterestPoint>,val latestTimestamp:Long)
+
+class BinanceFuturesRepository {
+    private val usd=BinanceFuturesApi.create("https://fapi.binance.com/")
+    private val coin=BinanceFuturesApi.create("https://dapi.binance.com/")
+    suspend fun markets(kind:String):List<FuturesMarket> {
+        val isUsd=kind=="USD_M"
+        val info=if(isUsd)usd.usdExchangeInfo() else coin.coinExchangeInfo()
+        val ticks=(if(isUsd)usd.usdTickers() else coin.coinTickers()).associateBy{it.symbol}
+        return info.symbols.asSequence().filter{it.status=="TRADING" && it.contractType in setOf("PERPETUAL","CURRENT_QUARTER","NEXT_QUARTER") && (!isUsd || it.quoteAsset in setOf("USDT","USDC"))}
+            .mapNotNull { c -> ticks[c.symbol]?.let { t -> FuturesMarket(c.symbol,c.pair?:c.symbol,c.contractType?:"UNKNOWN",c.marginAsset?:c.quoteAsset?:"",t.lastPrice,t.priceChangePercent,t.quoteVolume) } }
+            .sortedByDescending { it.quoteVolume.toDoubleOrNull()?:0.0 }.toList()
+    }
+    suspend fun ticker(symbol:String,kind:String):TickerDto {
+        val t=(if(kind=="USD_M")usd.usdTickers() else coin.coinTickers()).firstOrNull{it.symbol==symbol} ?: throw IllegalStateException("No Binance Futures ticker for $symbol")
+        return TickerDto(t.symbol,t.lastPrice,t.priceChangePercent,t.volume,t.quoteVolume)
+    }
+    suspend fun derivatives(symbol:String,kind:String):FuturesDerivativesSnapshot {
+        val isUsd=kind=="USD_M"
+        val premium=if(isUsd)usd.usdPremium(symbol) else coin.coinPremium(symbol)
+        val oi=if(isUsd)usd.usdOpenInterest(symbol) else coin.coinOpenInterest(symbol)
+        fun number(raw:String,label:String)=raw.toDoubleOrNull()?.takeIf{it.isFinite()} ?: throw IllegalStateException("Futures $label data is invalid.")
+        require(premium.symbol==symbol && oi.symbol==symbol) { "Futures derivatives symbol mismatch." }
+        val coinContract=if(isUsd)null else coin.coinExchangeInfo().symbols.firstOrNull{it.symbol==symbol}
+            ?: throw IllegalStateException("COIN-M contract metadata is unavailable for $symbol.")
+        val coinPair=coinContract?.pair?.takeIf{it.isNotBlank()}
+        val coinType=coinContract?.contractType?.takeIf{it in setOf("PERPETUAL","CURRENT_QUARTER","NEXT_QUARTER")}
+        if(!isUsd && (coinPair==null || coinType==null)) throw IllegalStateException("COIN-M pair or contract type metadata is missing for $symbol.")
+        val oiHistory:FuturesOpenInterestHistoryResult = if(isUsd) {
+            val rows=usd.usdOpenInterestHistory(symbol)
+            FuturesOpenInterestHistoryResult(rows,rows.lastOrNull()?.timestamp?:0L)
+        } else {
+            val rows=coin.coinOpenInterestHistory(coinPair!!,contractType=coinType)
+            FuturesOpenInterestHistoryResult(rows,rows.lastOrNull()?.timestamp?:0L)
+        }
+        val oiValues=oiHistory.rows.mapNotNull{it.sumOpenInterest.toDoubleOrNull()?.takeIf{v->v.isFinite()&&v>0}}
+        require(oiValues.size>=6) { "Futures open-interest history is incomplete." }
+        val latestRatio:FuturesLongShortPoint
+        val ratioTime:Long
+        val takerRatio:Double
+        val takerTime:Long
+        if(isUsd){
+            val ratios=usd.usdLongShortRatio(symbol)
+            val taker=usd.usdTakerRatio(symbol)
+            latestRatio=ratios.lastOrNull() ?: throw IllegalStateException("Futures long/short ratio is unavailable.")
+            val latestTaker=taker.lastOrNull() ?: throw IllegalStateException("Futures taker-flow ratio is unavailable.")
+            ratioTime=latestRatio.timestamp;takerTime=latestTaker.timestamp
+            takerRatio=number(latestTaker.buySellRatio,"taker ratio")
+        } else {
+            val ratios=coin.coinLongShortRatio(coinPair!!,contractType=coinType)
+            val taker=coin.coinTakerBuySellVolume(coinPair!!,coinType!!)
+            latestRatio=ratios.lastOrNull() ?: throw IllegalStateException("COIN-M long/short ratio is unavailable.")
+            val latestTaker=taker.lastOrNull() ?: throw IllegalStateException("COIN-M taker buy/sell volume is unavailable.")
+            ratioTime=latestRatio.timestamp;takerTime=latestTaker.timestamp
+            val buy=number(latestTaker.takerBuyVol,"taker buy volume")
+            val sell=number(latestTaker.takerSellVol,"taker sell volume")
+            require(sell>0.0) { "COIN-M taker sell volume is zero; ratio cannot be calculated." }
+            takerRatio=buy/sell
+        }
+        val oiNow=number(oi.openInterest,"open interest")
+        val oiChange=((oiValues.last()/oiValues.first())-1.0)*100.0
+        val observedAt=minOf(oiHistory.latestTimestamp,ratioTime,takerTime)
+        return FuturesDerivativesSnapshot(
+            symbol=symbol,markPrice=number(premium.markPrice,"mark price"),indexPrice=number(premium.indexPrice,"index price"),
+            fundingRate=number(premium.lastFundingRate,"funding rate"),nextFundingTime=premium.nextFundingTime,
+            openInterest=oiNow,openInterestChangePercent=oiChange,
+            longShortRatio=number(latestRatio.longShortRatio,"long/short ratio"),
+            takerBuySellRatio=takerRatio,observedAt=observedAt
+        )
+    }
+
+    suspend fun candles(symbol:String,interval:String,kind:String,limit:Int=1000,startTime:Long?=null,endTime:Long?=null):List<Candle> {
+        val safeLimit=limit.coerceIn(1,1500)
+        val rows=if(kind=="USD_M")usd.usdKlines(symbol,interval,safeLimit,startTime,endTime) else coin.coinKlines(symbol,interval,safeLimit,startTime,endTime)
+        return rows.map { r ->
+            require(r.size>=12){"Incomplete Binance Futures kline for $symbol"}
+            fun n(i:Int)=r[i].toString().toDoubleOrNull()?.takeIf{it.isFinite()} ?: throw IllegalStateException("Invalid Futures candle field $i")
+            Candle(n(0).toLong(),n(1),n(2),n(3),n(4),n(5),n(6).toLong(),n(7),n(8).toLong(),n(9),n(10))
+        }.sortedBy{it.time}.also { list -> require(list.zipWithNext().none{(a,b)->a.time>=b.time}){"Duplicate or unordered Binance Futures candles."} }
+    }
+}
