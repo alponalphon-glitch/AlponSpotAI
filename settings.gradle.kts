@@ -6,7 +6,7 @@ pluginManagement {
             }
         }
     }
-\n    repositories { google(); mavenCentral(); gradlePluginPortal() }\n}\npluginManagement {
+
     repositories {
         google()
         mavenCentral()
